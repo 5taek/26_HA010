@@ -774,7 +774,7 @@ Future<void> _registerPatientDevice({
     final deviceSnapshot = await transaction.get(deviceRef);
     if (!deviceSnapshot.exists) {
       throw const _RegistrationException(
-        '등록된 기기 ID가 없습니다. Firebase의 devices 문서 또는 라즈베리파이 기기 등록을 먼저 확인하세요.',
+        '등록된 기기 ID가 없습니다. Firebase의 devices 문서를 먼저 확인하세요.',
       );
     }
 

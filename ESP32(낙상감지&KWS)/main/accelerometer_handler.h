@@ -20,6 +20,8 @@ limitations under the License.
 #define kAccelChannelNumber 3
 #define kGyroChannelNumber 3
 
+#include <cstdint>
+
 #include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/core/api/error_reporter.h"
 
@@ -30,6 +32,12 @@ extern float g_latest_accel_z;
 extern float g_latest_gyro_x;
 extern float g_latest_gyro_y;
 extern float g_latest_gyro_z;
+extern volatile uint32_t g_imu_sample_count;
+
+// The magnetometer is an independent I2C device inside the LSM9DS1 package.
+// Its failure must never make the fall-detection AG setup fail.
+extern bool SetupMagnetometer();
+extern bool ReadMag(float* mx, float* my, float* mz);
 
 extern TfLiteStatus SetupImu(tflite::ErrorReporter* error_reporter);
 extern bool ReadImu(tflite::ErrorReporter* error_reporter, float* input,

@@ -4,6 +4,9 @@ set(FALL_DETECTION_EDGE_IMPULSE_DATA_FORWARDER OFF CACHE BOOL
 set(FALL_DETECTION_TEST_MODE OFF CACHE BOOL
     "Enable human-readable fall-detection and keyword-spotting logs on the shared USB port")
 
+set(NAV_MAG_CALIBRATION OFF CACHE BOOL
+    "Collect and print LSM9DS1 magnetometer calibration values for 30 seconds")
+
 set(FALL_DETECTION_SRCS
     "accelerometer_handler.cpp")
 
@@ -23,12 +26,14 @@ else()
         "ai_inference_lock.cc"
         "fall_alert_sender.cc"
         "keyword_spotting.cc"
+        "nav_heading.cc"
+        "usb_output.cc"
         "../models/fall_model.cc"
         "model_input_provider.cc"
         ${KWS_EDGE_IMPULSE_SRCS})
     set(FALL_DETECTION_REQUIRES
         driver esp-dsp esp_event esp_http_client esp_netif esp-tflite-micro
-        esp_timer esp_wifi nvs_flash mbedtls esp_driver_usb_serial_jtag)
+        esp_timer esp_wifi nvs_flash json mbedtls esp_driver_usb_serial_jtag)
 endif()
 
 idf_component_register(
@@ -54,6 +59,12 @@ if(FALL_DETECTION_TEST_MODE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE FALL_DETECTION_TEST_MODE=1)
 else()
     target_compile_definitions(${COMPONENT_LIB} PRIVATE FALL_DETECTION_TEST_MODE=0)
+endif()
+
+if(NAV_MAG_CALIBRATION)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE NAV_MAG_CALIBRATION=1)
+else()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE NAV_MAG_CALIBRATION=0)
 endif()
 
 if(NOT FALL_DETECTION_EDGE_IMPULSE_DATA_FORWARDER)

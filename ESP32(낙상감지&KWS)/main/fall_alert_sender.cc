@@ -1,4 +1,10 @@
 #include "fall_alert_sender.h"
+#include "fall_alert_outbox.h"
+#include "cJSON.h"
+#include "esp_random.h"
+#include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include <cstdio>
 #include <cstring>
@@ -30,14 +36,58 @@ constexpr uint32_t kReconnectBaseDelayMs = 1000;
 constexpr uint32_t kReconnectMaxDelayMs = 30000;
 constexpr uint32_t kReconnectMaxShift = 5;  // 1000ms << 5 = 32000ms, already past the cap
 
-struct AlertMessage {
-  char state[20];
-  char reason[64];
-  float score;
-};
-
+using AlertMessage = FallAlertRecord;
 EventGroupHandle_t wifi_events = nullptr;
-QueueHandle_t alert_queue = nullptr;
+FallAlertOutbox outbox;
+SemaphoreHandle_t outbox_mutex = nullptr;
+nvs_handle_t outbox_nvs = 0;
+uint64_t next_sequence = 1;
+// Producer touches RAM only; flash and HTTPS belong to background tasks.
+FallAlertOutbox ingress;
+portMUX_TYPE ingress_mux = portMUX_INITIALIZER_UNLOCKED;
+bool storage_ready = false;
+uint64_t persisted_sequence = 0;
+
+void SlotKey(int slot, char* key, size_t length) {
+  std::snprintf(key, length, "event_%02d", slot);
+}
+
+bool InitializeOutbox() {
+  // Erasing NVS on an initialization error would erase undelivered falls.
+  const esp_err_t init = nvs_flash_init();
+  if (init != ESP_OK) {
+    ESP_LOGE(kTag, "NVS init failed; preserving pending events: %s",
+             esp_err_to_name(init));
+    return false;
+  }
+  outbox_mutex = xSemaphoreCreateMutex();
+  if (outbox_mutex == nullptr ||
+      nvs_open("fall_outbox", NVS_READWRITE, &outbox_nvs) != ESP_OK) return false;
+  uint64_t stored_sequence = 0;
+  const esp_err_t sequence_result = nvs_get_u64(outbox_nvs, "sequence", &stored_sequence);
+  if (sequence_result != ESP_OK && sequence_result != ESP_ERR_NVS_NOT_FOUND) return false;
+  persisted_sequence = stored_sequence;
+  next_sequence = stored_sequence + 1;
+  for (int i = 0; i < FallAlertOutbox::kCapacity; ++i) {
+    char key[16];
+    SlotKey(i, key, sizeof(key));
+    size_t length = sizeof(AlertMessage);
+    AlertMessage record = {};
+    const esp_err_t result = nvs_get_blob(outbox_nvs, key, &record, &length);
+    if (result == ESP_ERR_NVS_NOT_FOUND) continue;
+    if (result != ESP_OK || length != sizeof(record) || record.version != 1 ||
+        record.event_id[32] != '\0' || record.state[19] != '\0' ||
+        record.reason[63] != '\0') {
+      ESP_LOGE(kTag, "Cannot read pending event slot %d", i);
+      return false;
+    }
+    outbox.records[i] = record;
+    outbox.occupied[i] = true;
+    if (record.sequence >= next_sequence) next_sequence = record.sequence + 1;
+  }
+  return true;
+}
+
 esp_timer_handle_t reconnect_timer = nullptr;
 uint32_t reconnect_attempt = 0;
 
@@ -91,14 +141,20 @@ bool PostAlert(const AlertMessage& alert) {
     return false;
   }
 
-  char json[256];
-  const int length = std::snprintf(
-      json, sizeof(json),
-      "{\"deviceId\":\"%s\",\"state\":\"%s\",\"reason\":\"%s\","
-      "\"score\":%.4f,\"deviceTimeMs\":%llu}",
-      CONFIG_FALL_FIREBASE_DEVICE_ID, alert.state, alert.reason, alert.score,
-      static_cast<unsigned long long>(esp_timer_get_time() / 1000));
-  if (length <= 0 || length >= static_cast<int>(sizeof(json))) return false;
+  cJSON* payload = cJSON_CreateObject();
+  if (payload == nullptr) return false;
+  const bool complete =
+      cJSON_AddStringToObject(payload, "deviceId", CONFIG_FALL_FIREBASE_DEVICE_ID) &&
+      cJSON_AddStringToObject(payload, "eventId", alert.event_id) &&
+      cJSON_AddStringToObject(payload, "state", alert.state) &&
+      cJSON_AddStringToObject(payload, "reason", alert.reason) &&
+      cJSON_AddNumberToObject(payload, "score", alert.score) &&
+      cJSON_AddNumberToObject(payload, "eventSequence", alert.sequence) &&
+      cJSON_AddNumberToObject(payload, "deviceTimeMs", alert.device_time_ms);
+  char* json = complete ? cJSON_PrintUnformatted(payload) : nullptr;
+  cJSON_Delete(payload);
+  if (json == nullptr) return false;
+  const int length = std::strlen(json);
 
   esp_http_client_config_t config = {};
   config.url = CONFIG_FALL_FIREBASE_FUNCTION_URL;
@@ -110,11 +166,11 @@ bool PostAlert(const AlertMessage& alert) {
   // PSRAM's extra access latency make the handshake's crypto/parsing slower
   // too -- 10s was getting exhausted by genuinely-still-progressing
   // connections, not stuck ones. This only raises the worst-case latency of
-  // one attempt; SenderTask's own 3-attempt retry loop is unchanged.
+  // one attempt. Pending events remain in NVS until the server accepts them.
   config.timeout_ms = 20000;
   config.crt_bundle_attach = esp_crt_bundle_attach;
   esp_http_client_handle_t client = esp_http_client_init(&config);
-  if (client == nullptr) return false;
+  if (client == nullptr) { cJSON_free(json); return false; }
   esp_http_client_set_header(client, "Content-Type", "application/json");
   esp_http_client_set_header(client, "X-Device-Token",
                              CONFIG_FALL_FIREBASE_DEVICE_TOKEN);
@@ -122,6 +178,7 @@ bool PostAlert(const AlertMessage& alert) {
   const esp_err_t result = esp_http_client_perform(client);
   const int status = esp_http_client_get_status_code(client);
   esp_http_client_cleanup(client);
+  cJSON_free(json);
   if (result != ESP_OK || status < 200 || status >= 300) {
     ESP_LOGE(kTag, "Firebase failed: error=%s HTTP=%d",
              esp_err_to_name(result), status);
@@ -131,38 +188,124 @@ bool PostAlert(const AlertMessage& alert) {
   return true;
 }
 
-void SenderTask(void*) {
-  AlertMessage alert = {};
+void StorageTask(void*) {
   while (true) {
-    if (xQueueReceive(alert_queue, &alert, portMAX_DELAY) != pdTRUE) continue;
-    for (int attempt = 1; attempt <= 3; ++attempt) {
-      if (PostAlert(alert)) break;
-      ESP_LOGW(kTag, "send retry %d/3", attempt);
-      vTaskDelay(pdMS_TO_TICKS(attempt * 2000));
+    AlertMessage alert = {};
+    portENTER_CRITICAL(&ingress_mux);
+    const int pending = ingress.SelectNext();
+    if (pending >= 0) alert = ingress.records[pending];
+    portEXIT_CRITICAL(&ingress_mux);
+    if (pending < 0) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+    xSemaphoreTake(outbox_mutex, portMAX_DELAY);
+    const int slot = outbox.FreeSlot(alert);
+    const bool replacing = slot >= 0 && outbox.occupied[slot];
+    const uint64_t high_sequence = alert.sequence > persisted_sequence
+                                     ? alert.sequence : persisted_sequence;
+    const bool saved = outbox.Add(alert, [&](int index, const AlertMessage& record) {
+      char key[16];
+      SlotKey(index, key, sizeof(key));
+      const char* stage = "sequence";
+      esp_err_t error = nvs_set_u64(outbox_nvs, "sequence", high_sequence);
+      if (error == ESP_OK) {
+        stage = "event_blob";
+        error = nvs_set_blob(outbox_nvs, key, &record, sizeof(record));
+      }
+      if (error == ESP_OK) {
+        stage = "commit";
+        error = nvs_commit(outbox_nvs);
+      }
+      if (error != ESP_OK) {
+        ESP_LOGE(kTag, "Outbox NVS failure: stage=%s error=%s slot=%d bytes=%u",
+                 stage, esp_err_to_name(error), index,
+                 static_cast<unsigned>(sizeof(record)));
+        nvs_stats_t stats = {};
+        if (nvs_get_stats(nullptr, &stats) == ESP_OK) {
+          ESP_LOGE(kTag, "NVS entries: used=%u available=%u total=%u",
+                   static_cast<unsigned>(stats.used_entries),
+                   static_cast<unsigned>(stats.available_entries),
+                   static_cast<unsigned>(stats.total_entries));
+        }
+      }
+      return error == ESP_OK;
+    });
+    if (saved) persisted_sequence = high_sequence;
+    xSemaphoreGive(outbox_mutex);
+    if (saved) {
+      if (replacing) ESP_LOGW(kTag, "Persistent outbox full; replaced an older event");
+      portENTER_CRITICAL(&ingress_mux);
+      ingress.Acknowledge(alert.event_id, [](int) { return true; });
+      portEXIT_CRITICAL(&ingress_mux);
+    } else {
+      if (slot < 0) {
+        ESP_LOGE(kTag, "Outbox slot selection failed; event remains in RAM");
+      } else {
+        ESP_LOGE(kTag, "Event remains in RAM; storage retry pending");
+      }
+      vTaskDelay(pdMS_TO_TICKS(1000));
     }
+  }
+}
+
+void SenderTask(void*) {
+  uint32_t retry_delay_ms = 1000;
+  while (true) {
+    AlertMessage alert = {};
+    xSemaphoreTake(outbox_mutex, portMAX_DELAY);
+    const int slot = outbox.SelectNext();
+    if (slot >= 0) alert = outbox.records[slot];
+    xSemaphoreGive(outbox_mutex);
+    if (slot < 0) {
+      retry_delay_ms = 1000;
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+    if (PostAlert(alert)) {
+      xSemaphoreTake(outbox_mutex, portMAX_DELAY);
+      const bool removed = outbox.Acknowledge(alert.event_id, [](int index) {
+        char key[16];
+        SlotKey(index, key, sizeof(key));
+        const esp_err_t erased = nvs_erase_key(outbox_nvs, key);
+        return (erased == ESP_OK || erased == ESP_ERR_NVS_NOT_FOUND) &&
+               nvs_commit(outbox_nvs) == ESP_OK;
+      });
+      xSemaphoreGive(outbox_mutex);
+      if (removed) { retry_delay_ms = 1000; continue; }
+      ESP_LOGE(kTag, "Accepted event retained because NVS erase failed");
+    }
+    // Re-select after each failed attempt so a newly arrived danger event
+    // takes priority over older safe reports. No retry-count discard.
+    vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
+    retry_delay_ms = retry_delay_ms < 30000 / 2 ? retry_delay_ms * 2 : 30000;
   }
 }
 }  // namespace
 
 void InitializeFallAlertSender() {
+  if (!InitializeOutbox()) {
+    ESP_LOGE(kTag, "Persistent outbox unavailable");
+    outbox_mutex = nullptr;
+    return;
+  }
+  if (xTaskCreatePinnedToCore(StorageTask, "fall_alert_storage", 4096, nullptr,
+                              2, nullptr, 0) != pdPASS) {
+    ESP_LOGE(kTag, "Storage task unavailable");
+    return;
+  }
+  storage_ready = true;
   if (std::strlen(CONFIG_FALL_WIFI_SSID) == 0 ||
       std::strlen(CONFIG_FALL_FIREBASE_FUNCTION_URL) == 0 ||
       std::strlen(CONFIG_FALL_FIREBASE_DEVICE_TOKEN) == 0) {
     ESP_LOGE(kTag, "Wi-Fi/Firebase configuration incomplete");
     return;
   }
-  esp_err_t result = nvs_flash_init();
-  if (result == ESP_ERR_NVS_NO_FREE_PAGES ||
-      result == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    ESP_ERROR_CHECK(nvs_flash_erase());
-    result = nvs_flash_init();
-  }
-  ESP_ERROR_CHECK(result);
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   esp_netif_create_default_wifi_sta();
   wifi_events = xEventGroupCreate();
-  alert_queue = xQueueCreate(4, sizeof(AlertMessage));
+  if (wifi_events == nullptr) {
+    ESP_LOGE(kTag, "Wi-Fi event group allocation failed; events stay in NVS");
+    return;
+  }
 
   esp_timer_create_args_t reconnect_timer_args = {};
   reconnect_timer_args.callback = &ReconnectTimerCallback;
@@ -188,15 +331,31 @@ void InitializeFallAlertSender() {
   // Kept on core 0 next to the Wi-Fi stack, and below the keyword-spotting
   // task's priority: alert delivery already retries, so it must not preempt
   // latency-sensitive inference with its CPU-heavy TLS handshakes.
-  xTaskCreatePinnedToCore(SenderTask, "fall_alert_sender", 8192, nullptr, 3,
-                          nullptr, 0);
+  if (xTaskCreatePinnedToCore(SenderTask, "fall_alert_sender", 8192, nullptr, 3,
+                              nullptr, 0) != pdPASS) {
+    ESP_LOGE(kTag, "Sender task unavailable; events stay in NVS");
+  }
 }
 
 bool QueueFallState(const char* state, const char* reason, float score) {
-  if (alert_queue == nullptr) return false;
+  if (!storage_ready || state == nullptr || reason == nullptr) return false;
   AlertMessage alert = {};
+  alert.version = 1;
+  alert.device_time_ms = esp_timer_get_time() / 1000;
   strlcpy(alert.state, state, sizeof(alert.state));
   strlcpy(alert.reason, reason, sizeof(alert.reason));
   alert.score = score;
-  return xQueueSend(alert_queue, &alert, 0) == pdTRUE;
+  uint8_t random_id[16];
+  esp_fill_random(random_id, sizeof(random_id));
+  for (size_t i = 0; i < sizeof(random_id); ++i)
+    std::snprintf(alert.event_id + i * 2, 3, "%02x", random_id[i]);
+  portENTER_CRITICAL(&ingress_mux);
+  alert.sequence = next_sequence++;
+  const int slot = ingress.FreeSlot(alert);
+  const bool replacing = slot >= 0 && ingress.occupied[slot];
+  const bool accepted = ingress.Add(alert, [](int, const AlertMessage&) { return true; });
+  portEXIT_CRITICAL(&ingress_mux);
+  if (replacing) ESP_LOGW(kTag, "RAM outbox full; replaced an older event");
+  if (!accepted) ESP_LOGE(kTag, "RAM outbox full of danger events; safe event rejected");
+  return accepted;
 }

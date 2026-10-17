@@ -21,6 +21,7 @@ limitations under the License.
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -30,14 +31,21 @@ constexpr gpio_num_t kI2cSclPin = GPIO_NUM_6;
 constexpr uint32_t kI2cFreqHz = 100000;
 
 constexpr uint8_t kLsm9ds1AgAddrCandidates[] = {0x6A, 0x6B};
+constexpr uint8_t kLsm9ds1MagAddrCandidates[] = {0x1E, 0x1C};
 constexpr uint8_t kRegWhoAmI = 0x0F;
 constexpr uint8_t kExpectedWhoAmIAg = 0x68;
+constexpr uint8_t kExpectedWhoAmIMag = 0x3D;
 constexpr uint8_t kRegCtrlReg1G = 0x10;
 constexpr uint8_t kRegOutXLG = 0x18;
 constexpr uint8_t kRegCtrlReg4 = 0x1E;
 constexpr uint8_t kRegCtrlReg5Xl = 0x1F;
 constexpr uint8_t kRegCtrlReg6Xl = 0x20;
 constexpr uint8_t kRegOutXL = 0x28;
+constexpr uint8_t kRegCtrlReg1M = 0x20;
+constexpr uint8_t kRegCtrlReg2M = 0x21;
+constexpr uint8_t kRegCtrlReg3M = 0x22;
+constexpr uint8_t kRegCtrlReg4M = 0x23;
+constexpr uint8_t kRegOutXM = 0x28;
 
 constexpr int kMaxSamplesPerInference = 256;
 // FS_XL = +-2g (0.061 mg/LSB per LSM9DS1 datasheet). Reverted from +-8g:
@@ -46,13 +54,26 @@ constexpr int kMaxSamplesPerInference = 256;
 // physically "ideal" wider range. Revisit once data is recollected at +-8g.
 constexpr float kAccelScaleGPerLsb = 0.000061f;
 constexpr float kGyroScaleDpsPerLsb = 0.00875f;
+constexpr float kMagScaleGaussPerLsb = 0.00014f;
 constexpr int kI2cTimeoutMs = 100;
+// At CONFIG_FREERTOS_HZ=100, pdMS_TO_TICKS(5) is zero. The I2C
+// transaction must wait for completion rather than polling with zero ticks.
+constexpr int kMagReadTimeoutMs = 20;
+static_assert(pdMS_TO_TICKS(kMagReadTimeoutMs) > 0,
+              "Magnetometer timeout must allow at least one RTOS tick");
+constexpr int kMagProbeTimeoutMs = 20;
+constexpr int64_t kMagRetryIntervalUs = 5000000;
 constexpr char kTag[] = "imu_handler";
 
 bool g_imu_ready = false;
+bool g_mag_ready = false;
 uint8_t g_ag_addr = 0;
+uint8_t g_mag_addr = 0;
 i2c_master_bus_handle_t g_i2c_bus = nullptr;
 i2c_master_dev_handle_t g_ag_dev = nullptr;
+i2c_master_dev_handle_t g_mag_dev = nullptr;
+int64_t g_mag_last_retry_us = 0;
+int g_mag_read_failures = 0;
 float g_feature_buffer[kMaxSamplesPerInference * kChannelNumber] = {0.0f};
 int g_sample_count = 0;
 
@@ -64,6 +85,11 @@ esp_err_t WriteReg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value) {
 esp_err_t ReadRegs(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t* data,
                    size_t len) {
   return i2c_master_transmit_receive(dev, &reg, 1, data, len, kI2cTimeoutMs);
+}
+
+esp_err_t ReadRegsWithTimeout(i2c_master_dev_handle_t dev, uint8_t reg,
+                              uint8_t* data, size_t len, int timeout_ms) {
+  return i2c_master_transmit_receive(dev, &reg, 1, data, len, timeout_ms);
 }
 
 int16_t ReadInt16Le(const uint8_t* data) {
@@ -110,6 +136,40 @@ bool DetectLsm9ds1AgAddress(tflite::ErrorReporter* error_reporter,
   error_reporter->Report("LSM9DS1 AG not found at 0x6A/0x6B");
   return false;
 }
+
+bool DetectLsm9ds1MagAddress() {
+  for (uint8_t addr : kLsm9ds1MagAddrCandidates) {
+    i2c_device_config_t dev_cfg = {};
+    dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    dev_cfg.device_address = addr;
+    dev_cfg.scl_speed_hz = kI2cFreqHz;
+
+    i2c_master_dev_handle_t dev = nullptr;
+    const esp_err_t probe = i2c_master_probe(g_i2c_bus, addr,
+        g_imu_ready ? kMagProbeTimeoutMs : kI2cTimeoutMs);
+    ESP_LOGI(kTag, "MAG address probe 0x%02X: %s", addr, esp_err_to_name(probe));
+    if (probe != ESP_OK) continue;
+    const esp_err_t add_error = i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &dev);
+    if (add_error != ESP_OK) {
+      ESP_LOGW(kTag, "MAG add device failed: %s", esp_err_to_name(add_error));
+      continue;
+    }
+
+    uint8_t who = 0;
+    const esp_err_t read_err = ReadRegsWithTimeout(
+        dev, kRegWhoAmI, &who, 1,
+        g_imu_ready ? kMagProbeTimeoutMs : kI2cTimeoutMs);
+    ESP_LOGI(kTag, "Probe MAG addr 0x%02X -> error=%s, who=0x%02X expected=0x%02X",
+             addr, esp_err_to_name(read_err), who, kExpectedWhoAmIMag);
+    if (read_err == ESP_OK && who == kExpectedWhoAmIMag) {
+      g_mag_dev = dev;
+      g_mag_addr = addr;
+      return true;
+    }
+    i2c_master_bus_rm_device(dev);
+  }
+  return false;
+}
 }  // namespace
 
 int begin_index = 0;
@@ -119,6 +179,101 @@ float g_latest_accel_z = 0.0f;
 float g_latest_gyro_x = 0.0f;
 float g_latest_gyro_y = 0.0f;
 float g_latest_gyro_z = 0.0f;
+volatile uint32_t g_imu_sample_count = 0;
+
+bool SetupMagnetometer() {
+  if (g_mag_ready && g_mag_dev != nullptr) return true;
+  g_mag_last_retry_us = esp_timer_get_time();
+  if (g_mag_dev != nullptr) {
+    const esp_err_t removed = i2c_master_bus_rm_device(g_mag_dev);
+    if (removed != ESP_OK) return false;
+    g_mag_dev = nullptr;
+  }
+  if (g_i2c_bus == nullptr || !DetectLsm9ds1MagAddress()) {
+    ESP_LOGW(kTag, "LSM9DS1 magnetometer unavailable; heading quality is invalid");
+    return false;
+  }
+
+  // These writes only address the magnetometer device. The existing AG
+  // configuration registers remain untouched.
+  const struct {
+    uint8_t reg;
+    uint8_t value;
+    const char* name;
+  } config[] = {
+      {kRegCtrlReg1M, 0xFC, "CTRL_REG1_M"},  // temp comp, XY ultra, 80 Hz
+      {kRegCtrlReg2M, 0x00, "CTRL_REG2_M"},  // +/-4 gauss
+      {kRegCtrlReg3M, 0x00, "CTRL_REG3_M"},  // continuous conversion
+      {kRegCtrlReg4M, 0x0C, "CTRL_REG4_M"},  // Z ultra performance
+  };
+  for (const auto& item : config) {
+    const esp_err_t err = WriteReg(g_mag_dev, item.reg, item.value);
+    if (err != ESP_OK) {
+      ESP_LOGW(kTag, "magnetometer %s write failed: %d", item.name,
+               static_cast<int>(err));
+      g_mag_ready = false;
+      i2c_master_bus_rm_device(g_mag_dev);
+      g_mag_dev = nullptr;
+      return false;
+    }
+  }
+
+  g_mag_ready = true;
+  g_mag_read_failures = 0;
+  ESP_LOGI(kTag, "LSM9DS1 magnetometer ready at 0x%02X", g_mag_addr);
+  return true;
+}
+
+bool ReadMag(float* mx, float* my, float* mz) {
+  static uint32_t failure_count = 0;
+  if (mx == nullptr || my == nullptr || mz == nullptr) return false;
+  // Called only by SensorTask, which owns the I2C bus. Throttle rediscovery
+  // and keep ordinary per-sample reads at their existing short timeout.
+  if (!g_mag_ready && g_i2c_bus != nullptr &&
+      esp_timer_get_time() - g_mag_last_retry_us >= kMagRetryIntervalUs) {
+    SetupMagnetometer();
+  }
+  if (!g_mag_ready || g_mag_dev == nullptr || mx == nullptr || my == nullptr ||
+      mz == nullptr) {
+#if FALL_DETECTION_TEST_MODE
+    if (++failure_count % 25 == 1) {
+      ESP_LOGW(kTag, "MAG_READ unavailable: initialized=%d device=%d; check boot Probe MAG logs",
+               g_mag_ready ? 1 : 0, g_mag_dev != nullptr ? 1 : 0);
+    }
+#endif
+    return false;
+  }
+
+  uint8_t raw[6] = {};
+  const uint8_t reg = static_cast<uint8_t>(kRegOutXM | 0x80);
+  const esp_err_t mag_error = ReadRegsWithTimeout(
+      g_mag_dev, reg, raw, sizeof(raw), kMagReadTimeoutMs);
+  if (mag_error != ESP_OK) {
+    if (++g_mag_read_failures >= 25) {
+      g_mag_ready = false;
+      g_mag_last_retry_us = esp_timer_get_time();
+    }
+#if FALL_DETECTION_TEST_MODE
+    if (++failure_count % 25 == 1) {
+      ESP_LOGW(kTag, "MAG_READ failed: addr=0x%02X error=%s timeout_ms=%d",
+               g_mag_addr, esp_err_to_name(mag_error), kMagReadTimeoutMs);
+    }
+#endif
+    return false;
+  }
+  failure_count = 0;
+  g_mag_read_failures = 0;
+
+  const float sensor_x = ReadInt16Le(&raw[0]) * kMagScaleGaussPerLsb;
+  const float sensor_y = ReadInt16Le(&raw[2]) * kMagScaleGaussPerLsb;
+  const float sensor_z = ReadInt16Le(&raw[4]) * kMagScaleGaussPerLsb;
+  // Align the magnetometer axes with the accelerometer/gyro coordinate frame.
+  // Final signs/order must be confirmed on the assembled cane bench test.
+  *mx = -sensor_y;
+  *my = -sensor_x;
+  *mz = sensor_z;
+  return true;
+}
 
 TfLiteStatus SetupImu(tflite::ErrorReporter* error_reporter) {
   if (g_imu_ready && g_ag_dev != nullptr) {
@@ -195,9 +350,14 @@ TfLiteStatus SetupImu(tflite::ErrorReporter* error_reporter) {
     return kTfLiteError;
   }
 
+  // Heading is optional. A missing/disturbed magnetometer reports ok=0 but
+  // must not prevent the trained six-axis fall pipeline from starting.
+  SetupMagnetometer();
+
   std::memset(g_feature_buffer, 0, sizeof(g_feature_buffer));
   g_sample_count = 0;
   begin_index = 0;
+  g_imu_sample_count = 0;
   g_imu_ready = true;
   ESP_LOGI(kTag, "SetupImu done");
   return kTfLiteOk;
@@ -272,6 +432,7 @@ bool ReadImu(tflite::ErrorReporter* error_reporter, float* input, int length,
   g_latest_gyro_x = gyro_x_dps;
   g_latest_gyro_y = gyro_y_dps;
   g_latest_gyro_z = gyro_z_dps;
+  g_imu_sample_count = g_imu_sample_count + 1;
 
   if (g_sample_count < required_samples) {
     g_sample_count++;
@@ -286,7 +447,8 @@ bool ReadImu(tflite::ErrorReporter* error_reporter, float* input, int length,
     // complete window has been consumed, start collecting the next one
     // from scratch instead of sliding forward by a single sample. This
     // matches how the model was trained/validated in Edge Impulse Studio
-    // (window size == window increase == 10s). The single-sample streaming
+    // (window size == window increase; length comes from the active model).
+    // The single-sample streaming
     // path used by the data forwarder (required_samples == 1) is untouched.
     std::memset(g_feature_buffer, 0, sizeof(g_feature_buffer));
     g_sample_count = 0;

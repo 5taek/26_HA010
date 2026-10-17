@@ -723,6 +723,10 @@ class _LocationMapPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final location = this.location;
+    final locationTime = _timestampMillis(location?.createdAt);
+    final staleLocation = location != null &&
+        (locationTime == 0 ||
+            DateTime.now().millisecondsSinceEpoch - locationTime > 120000);
 
     return Card(
       child: Padding(
@@ -758,6 +762,18 @@ class _LocationMapPanel extends StatelessWidget {
               )
             else
               _LocationSummary(location: location),
+            if (staleLocation)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  locationTime == 0
+                      ? '위치 갱신 시각을 확인할 수 없습니다.'
+                      : '2분 이상 갱신되지 않은 위치입니다. 현재 위치와 다를 수 있습니다.',
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.error,
+                  ),
+                ),
+              ),
           ],
         ),
       ),
@@ -1406,7 +1422,10 @@ String _eventLoadErrorMessage(Object? error) {
 }
 
 int _createdAtMillis(Map<String, dynamic> data) {
-  final raw = data['createdAt'];
+  return _timestampMillis(data['createdAt']);
+}
+
+int _timestampMillis(dynamic raw) {
   if (raw is Timestamp) {
     return raw.millisecondsSinceEpoch;
   }
@@ -1460,9 +1479,10 @@ _EventLocation? _locationFromEventData(Map<String, dynamic> data) {
       locationMap['formattedAddress'],
       locationMap['fullAddress'],
     ]),
-    createdAt: data['createdAt'] ??
+    createdAt: locationMap['sampledAt'] ??
+        locationMap['updatedAt'] ??
         locationMap['timestamp'] ??
-        locationMap['updatedAt'],
+        data['createdAt'],
   );
 }
 
@@ -1497,10 +1517,10 @@ _EventLocation? _locationFromDeviceData(Map<String, dynamic> data) {
       locationMap['fullAddress'],
       data['address'],
     ]),
-    createdAt: locationMap['updatedAt'] ??
+    createdAt: locationMap['sampledAt'] ??
+        locationMap['updatedAt'] ??
         locationMap['timestamp'] ??
-        data['lastSeenAt'] ??
-        data['updatedAt'],
+        data['lastLocationAt'],
   );
 }
 

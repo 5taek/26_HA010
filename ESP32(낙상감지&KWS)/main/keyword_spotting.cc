@@ -13,6 +13,7 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "usb_output.h"
 
 namespace {
 constexpr char kTag[] = "keyword_spotting";
@@ -26,7 +27,7 @@ constexpr int kUsbChunkBytes = 512;
 // If the stream goes quiet this many consecutive reads (~2s) mid-window,
 // treat it as an aborted transfer and go back to watching for a new one.
 constexpr int kMaxConsecutiveEmptyReads = 20;
-constexpr float kResultThreshold = 0.60f;
+constexpr float kResultThreshold = EI_CLASSIFIER_THRESHOLD;
 #if FALL_DETECTION_TEST_MODE
 constexpr size_t kReceiveProgressBytes = 4096;
 #endif
@@ -41,8 +42,9 @@ int GetSignalData(size_t offset, size_t length, float* output) {
 }
 
 void WriteUsb(const char* message) {
-  usb_serial_jtag_write_bytes(message, std::strlen(message),
-                              pdMS_TO_TICKS(200));
+  if (!UsbWriteLine(message, std::strlen(message), pdMS_TO_TICKS(200))) {
+    ESP_LOGW(kTag, "USB response did not send: %s", message);
+  }
 }
 
 // Blocks in short polling ticks until the first bytes of a new window
@@ -175,13 +177,19 @@ void RunKeywordInference() {
 
 void KeywordTask(void*) {
   auto* destination = reinterpret_cast<uint8_t*>(inference_audio);
+  // The host must only send one complete PCM window after each ready marker.
+  // This preserves the 16-bit sample boundary and prevents a delayed/partial
+  // transfer from shifting every sample in the following inference window.
+  WriteUsb("S3_READY\n");
   while (true) {
     const size_t received = WaitForWindowStart(destination);
     ESP_LOGI(kTag, "audio window started");
     if (!FinishReceivingWindow(destination, received)) {
+      WriteUsb("S3_READY\n");
       continue;
     }
     RunKeywordInference();
+    WriteUsb("S3_READY\n");
   }
 }
 }  // namespace
@@ -213,6 +221,10 @@ void InitializeKeywordSpotting() {
   // routes ALL console output through the same ring buffer so log lines and
   // KWS responses interleave cleanly instead of corrupting each other.
   usb_serial_jtag_vfs_use_driver();
+  if (!InitializeUsbOutput()) {
+    ESP_LOGE(kTag, "USB output lock init failed");
+    return;
+  }
 
   // Pinned to core 1 and given a priority above the alert sender: Wi-Fi and
   // the fall-detection loop both live on core 0, and the sender's TLS

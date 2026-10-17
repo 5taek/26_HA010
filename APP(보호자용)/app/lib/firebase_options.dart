@@ -1,10 +1,8 @@
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart';
 
-/// Temporary Firebase options.
-///
-/// Replace this file by running `flutterfire configure` from the app directory.
-/// The environment variable fallback is only for early local experiments.
+/// Firebase options for com.tinyvisioncane.guardian.
+/// Keep these values aligned with android/app/google-services.json.
 class DefaultFirebaseOptions {
   static FirebaseOptions get currentPlatform {
     if (kIsWeb) {
@@ -26,7 +24,7 @@ class DefaultFirebaseOptions {
 
   static const FirebaseOptions android = FirebaseOptions(
     apiKey: 'AIzaSyA-l5z-XgfCOr6vuRqx2vSTZB8TGDDiRqg',
-    appId: '1:296288710255:android:4b4e4808d58c355f04e79a',
+    appId: '1:296288710255:android:4c682778365d93f404e79a',
     messagingSenderId: '296288710255',
     projectId: 'tiny-vision-cane-6e80d',
     storageBucket: 'tiny-vision-cane-6e80d.firebasestorage.app',

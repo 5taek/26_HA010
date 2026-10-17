@@ -6,9 +6,14 @@
 
 TfLiteStatus SetupModelInputProvider(tflite::ErrorReporter* error_reporter);
 
-// Read the IMU, maintain a sliding window, and fill one model input tensor.
-// Return true when input is ready for Invoke(), or false while the window warms up.
-bool FillModelInput(TfLiteTensor* input,
-                    tflite::ErrorReporter* error_reporter);
+// Return the number of scalar features expected by the fall model.
+int ModelInputFeatureCount(const TfLiteTensor* input);
+
+// Convert one already-complete 6-axis IMU window into the model tensor.
+// Sensor I/O intentionally happens outside this function so inference can
+// wait for KWS without stopping the 25 Hz acquisition task.
+bool FillModelInputFromFeatures(TfLiteTensor* input, const float* features,
+                                int feature_length,
+                                tflite::ErrorReporter* error_reporter);
 
 #endif  // FALL_DETECTION_MAIN_MODEL_INPUT_PROVIDER_H_

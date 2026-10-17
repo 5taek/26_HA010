@@ -1,19 +1,22 @@
 #include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <freertos/task.h>
 
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 
 #include "esp_log.h"
-
-#include "driver/usb_serial_jtag.h"
 
 #include "accelerometer_handler.h"
 #include "ai_inference_lock.h"
 #include "fall_alert_sender.h"
 #include "keyword_spotting.h"
 #include "model_input_provider.h"
+#include "fall_input_diagnostics.h"
+#include "nav_heading.h"
+#include "usb_output.h"
 
 #include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/core/api/error_reporter.h"
@@ -29,6 +32,8 @@ namespace {
 constexpr char kTag[] = "fall_detector";
 constexpr int kTensorArenaSize = 80 * 1024;
 constexpr int kLoopDelayMs = 40;
+constexpr int kMaxFeatureCount = 256 * kChannelNumber;
+constexpr int kWindowBufferCount = 2;
 constexpr float kEventThreshold = 0.50f;
 
 // Pickup is a post-event rule, not a model class. After an event, the cane is
@@ -59,7 +64,19 @@ tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* model_input = nullptr;
 TfLiteTensor* model_output = nullptr;
 bool setup_ok = false;
-uint32_t loop_count = 0;
+int model_feature_count = 0;
+
+// The sensor task writes a complete window into sensor_window, then copies it
+// into one of two inference buffers. The inference task returns each buffer to
+// free_window_queue only after Invoke() has finished with it.
+float sensor_window[kMaxFeatureCount] = {0.0f};
+float inference_windows[kWindowBufferCount][kMaxFeatureCount] = {};
+QueueHandle_t free_window_queue = nullptr;
+QueueHandle_t ready_window_queue = nullptr;
+StaticQueue_t free_window_queue_storage = {};
+StaticQueue_t ready_window_queue_storage = {};
+uint8_t free_window_queue_data[kWindowBufferCount * sizeof(uint8_t)] = {};
+uint8_t ready_window_queue_data[kWindowBufferCount * sizeof(uint8_t)] = {};
 
 enum class PredictionKind {
   kUnknown,
@@ -82,6 +99,12 @@ struct CanePrediction {
   float event_score;
 };
 
+// Event-only mailbox: repeated event predictions coalesce, and NORMAL must
+// never overwrite an unconsumed EVENT. Only SensorTask owns monitor state.
+QueueHandle_t prediction_queue = nullptr;
+StaticQueue_t prediction_queue_storage = {};
+uint8_t prediction_queue_data[sizeof(CanePrediction)] = {};
+
 struct AccelSample {
   float x;
   float y;
@@ -89,6 +112,7 @@ struct AccelSample {
   float magnitude;
 };
 
+// Accessed exclusively by SensorTask after startup.
 EventMonitorState event_monitor_state = EventMonitorState::kIdle;
 uint32_t event_started_at_ms = 0;
 uint32_t alert_sent_at_ms = 0;
@@ -196,12 +220,10 @@ void PrintTextAction(const char* action, const char* reason) {
 }
 
 void NotifyRpi(uint8_t signal, const char* action, const char* reason) {
-  const int written =
-      usb_serial_jtag_write_bytes(&signal, 1, pdMS_TO_TICKS(200));
-  if (written != 1) {
+  if (!UsbWriteSignal(signal, pdMS_TO_TICKS(200))) {
     ESP_LOGW(kTag,
-             "RPi5 signal 0x%02X did not send (wrote %d, action=%s)",
-             static_cast<unsigned>(signal), written, action);
+             "RPi5 signal 0x%02X did not send (action=%s)",
+             static_cast<unsigned>(signal), action);
   }
   ESP_LOGW(kTag, "ACTION=%s signal=0x%02X reason=%s", action,
            static_cast<unsigned>(signal), reason);
@@ -257,7 +279,8 @@ bool DetectPickupMotion(uint32_t now_ms) {
 void ResolveEventAsSafe(const char* reason) {
   ESP_LOGI(kTag, "event resolved without guardian alert: %s", reason);
   NotifyRpi(kFallResolvedByte, "RPI_FALL_RESOLVED", reason);
-  QueueFallState("safe_fall", reason, 0.0f);
+  if (!QueueFallState("safe_fall", reason, 0.0f))
+    ESP_LOGE(kTag, "Safe event could not enter the delivery queue");
   PrintTextAction("알림 취소", reason);
   ResetPostEventMonitor();
 }
@@ -271,7 +294,8 @@ void SendEmergencyAlert(uint32_t now_ms, const char* reason) {
   alert_sent_at_ms = now_ms;
   NotifyRpi(kFallDangerByte, "RPI_FALL_DANGER", reason);
   ReportAlertAction(reason);
-  QueueFallState("danger_fall", reason, 1.0f);
+  if (!QueueFallState("danger_fall", reason, 1.0f))
+    ESP_LOGE(kTag, "Danger event could not enter the delivery queue");
 }
 
 void UpdatePostEventMonitor(uint32_t now_ms) {
@@ -352,12 +376,12 @@ bool ReadCanePrediction(const TfLiteTensor* output, CanePrediction* prediction) 
   return false;
 }
 
-// Only arms the post-event monitor on a fresh model prediction. Called at
-// most once per classification window (now every ~10s), unlike
-// UpdatePostEventMonitor which must keep running every loop regardless.
-void HandlePredictionAction(const CanePrediction& prediction) {
+// Inference publishes values only; it never reads or changes monitor state.
+void PublishPrediction(const CanePrediction& prediction) {
   if (prediction.kind == PredictionKind::kEvent) {
-    StartPostEventMonitor(NowMs(), "event_detected");
+    if (xQueueOverwrite(prediction_queue, &prediction) != pdPASS) {
+      ESP_LOGE(kTag, "failed to publish fall event prediction");
+    }
   }
 }
 
@@ -425,37 +449,114 @@ void SetupFallDetector() {
     return;
   }
 
+  model_feature_count = ModelInputFeatureCount(model_input);
+  if (model_feature_count <= 0 || model_feature_count > kMaxFeatureCount ||
+      (model_feature_count % kChannelNumber) != 0) {
+    error_reporter->Report("Unsupported fall input feature count: %d",
+                           model_feature_count);
+    return;
+  }
+
   LogTensorInfo("input", model_input);
   LogTensorInfo("output", model_output);
   setup_ok = true;
   ESP_LOGI(kTag, "event detector setup complete");
 }
 
-void RunFallDetectorOnce() {
-  ++loop_count;
+bool InitializeFallPipeline() {
+  free_window_queue = xQueueCreateStatic(
+      kWindowBufferCount, sizeof(uint8_t), free_window_queue_data,
+      &free_window_queue_storage);
+  ready_window_queue = xQueueCreateStatic(
+      kWindowBufferCount, sizeof(uint8_t), ready_window_queue_data,
+      &ready_window_queue_storage);
+  prediction_queue = xQueueCreateStatic(
+      1, sizeof(CanePrediction), prediction_queue_data,
+      &prediction_queue_storage);
+  if (free_window_queue == nullptr || ready_window_queue == nullptr ||
+      prediction_queue == nullptr) {
+    ESP_LOGE(kTag, "failed to create fall pipeline queues");
+    return false;
+  }
 
-  // Pickup detection and the alert buzzer timeout are plain accelerometer/
-  // timer checks, independent of the classifier. They must keep running
-  // every loop (40ms) even though a new model prediction now only arrives
-  // once per ~10s classification window.
-  UpdatePostEventMonitor(NowMs());
+  for (uint8_t index = 0; index < kWindowBufferCount; ++index) {
+    if (xQueueSend(free_window_queue, &index, 0) != pdTRUE) return false;
+  }
+  return true;
+}
 
-  if (!setup_ok) {
-    if ((loop_count % 100) == 0) {
-      ESP_LOGW(kTag, "setup is not complete; waiting for valid model/input");
+void PublishCompletedWindow() {
+  uint8_t index = 0;
+  if (xQueueReceive(free_window_queue, &index, 0) != pdTRUE) {
+    // Inference is behind. Replace the oldest queued (not currently active)
+    // window so fall decisions stay based on the freshest sensor history.
+    if (xQueueReceive(ready_window_queue, &index, 0) != pdTRUE) {
+      ESP_LOGW(kTag, "all fall buffers are busy; dropping completed window");
+      return;
     }
+    ESP_LOGW(kTag, "fall inference behind; replacing oldest queued window");
+  }
+
+  std::memcpy(inference_windows[index], sensor_window,
+              sizeof(float) * model_feature_count);
+  if (xQueueSend(ready_window_queue, &index, 0) != pdTRUE) {
+    xQueueSend(free_window_queue, &index, 0);
+    ESP_LOGW(kTag, "failed to queue completed fall window");
+  }
+}
+
+void SensorTask(void*) {
+  const TickType_t loop_period = pdMS_TO_TICKS(kLoopDelayMs);
+  TickType_t last_wake_time = xTaskGetTickCount();
+  while (true) {
+    const bool window_ready =
+        ReadImu(error_reporter, sensor_window, model_feature_count, false);
+    if (window_ready) {
+      PublishCompletedWindow();
+    }
+
+    // This task remains the sole I2C owner. Navigation gets a value snapshot
+    // through its queue and never touches the bus or the FD feature window.
+    NavSensorSample nav_sample = {};
+    nav_sample.accel[0] = g_latest_accel_x;
+    nav_sample.accel[1] = g_latest_accel_y;
+    nav_sample.accel[2] = g_latest_accel_z;
+    nav_sample.gyro[0] = g_latest_gyro_x;
+    nav_sample.gyro[1] = g_latest_gyro_y;
+    nav_sample.gyro[2] = g_latest_gyro_z;
+    nav_sample.mag_ok = ReadMag(&nav_sample.mag[0], &nav_sample.mag[1],
+                                &nav_sample.mag[2]);
+    nav_sample.sample_count = g_imu_sample_count;
+    nav_sample.timestamp_ms = NowMs();
+    PublishNavSensorSample(nav_sample);
+
+    // Pickup monitoring consumes the same fresh accelerometer sample but is
+    // independent of either ML interpreter. Start the pickup grace period
+    // when this task consumes the event, so queue latency cannot shorten it.
+    CanePrediction prediction = {};
+    if (xQueueReceive(prediction_queue, &prediction, 0) == pdTRUE) {
+      StartPostEventMonitor(nav_sample.timestamp_ms, "event_detected");
+    }
+    UpdatePostEventMonitor(nav_sample.timestamp_ms);
+
+    const TickType_t now = xTaskGetTickCount();
+    if (static_cast<TickType_t>(now - last_wake_time) >= loop_period) {
+      last_wake_time = now;
+    }
+    vTaskDelayUntil(&last_wake_time, loop_period);
+  }
+}
+
+void RunFallInference(uint8_t window_index) {
+  LogFallInputDiagnostics(inference_windows[window_index], model_feature_count);
+  if (!FillModelInputFromFeatures(model_input,
+                                  inference_windows[window_index],
+                                  model_feature_count, error_reporter)) {
     return;
   }
 
-  if (!FillModelInput(model_input, error_reporter)) {
-    if ((loop_count % 100) == 0) {
-      ESP_LOGI(kTag, "model input is not ready");
-    }
-    return;
-  }
-
-  if (!LockAiInference(pdMS_TO_TICKS(2000))) {
-    ESP_LOGW(kTag, "inference busy; skipping fall window");
+  if (!LockAiInference(pdMS_TO_TICKS(8000))) {
+    ESP_LOGW(kTag, "inference busy; dropping fall window");
     return;
   }
   const TfLiteStatus invoke_status = interpreter->Invoke();
@@ -476,7 +577,19 @@ void RunFallDetectorOnce() {
            prediction.top_index, prediction.top_score, prediction.normal_score,
            prediction.event_score);
 
-  HandlePredictionAction(prediction);
+  PublishPrediction(prediction);
+}
+
+void FallInferenceTask(void*) {
+  while (true) {
+    uint8_t window_index = 0;
+    if (xQueueReceive(ready_window_queue, &window_index, portMAX_DELAY) !=
+        pdTRUE) {
+      continue;
+    }
+    RunFallInference(window_index);
+    xQueueSend(free_window_queue, &window_index, portMAX_DELAY);
+  }
 }
 }  // namespace
 
@@ -493,14 +606,20 @@ extern "C" void app_main(void) {
   InitializeFallAlertSender();
   SetupFallDetector();
   InitializeKeywordSpotting();
-  // vTaskDelayUntil keeps the period at a true kLoopDelayMs regardless of how
-  // long RunFallDetectorOnce takes (I2C reads, mutex waits, logging) -- with
-  // plain vTaskDelay the real interval is kLoopDelayMs *plus* that work, so
-  // the sampling rate silently drifts below the 25 Hz the model was trained
-  // and windowed at.
-  TickType_t last_wake_time = xTaskGetTickCount();
-  while (true) {
-    RunFallDetectorOnce();
-    vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(kLoopDelayMs));
+
+  const bool nav_ok = InitializeNavHeading();
+  if (!nav_ok) ESP_LOGE(kTag, "navigation heading task did not start");
+
+  if (setup_ok && InitializeFallPipeline()) {
+    // Both tasks stay on core 0. SensorTask has the higher priority so KWS,
+    // TLS, or fall inference cannot distort the trained 25 Hz sample timing.
+    xTaskCreatePinnedToCore(SensorTask, "fall_sensor", 4096, nullptr, 6,
+                            nullptr, 0);
+    xTaskCreatePinnedToCore(FallInferenceTask, "fall_inference", 8192,
+                            nullptr, 4, nullptr, 0);
+  } else {
+    ESP_LOGE(kTag, "fall pipeline did not start");
   }
+
+  vTaskDelete(nullptr);
 }

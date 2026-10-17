@@ -10,7 +10,6 @@ namespace {
 constexpr char kTag[] = "model_input";
 constexpr int kMaxFeatureLength = 256 * kChannelNumber;
 
-float feature_buffer[kMaxFeatureLength] = {0.0f};
 bool input_provider_ready = false;
 
 int ElementCount(const TfLiteTensor* tensor) {
@@ -63,14 +62,19 @@ TfLiteStatus SetupModelInputProvider(tflite::ErrorReporter* error_reporter) {
   return status;
 }
 
-bool FillModelInput(TfLiteTensor* input,
-                    tflite::ErrorReporter* error_reporter) {
+int ModelInputFeatureCount(const TfLiteTensor* input) {
+  return ElementCount(input);
+}
+
+bool FillModelInputFromFeatures(TfLiteTensor* input, const float* features,
+                                int feature_length,
+                                tflite::ErrorReporter* error_reporter) {
   if (!input_provider_ready) {
     error_reporter->Report("Model input provider is not ready");
     return false;
   }
-  if (input == nullptr) {
-    error_reporter->Report("Model input tensor is null");
+  if (input == nullptr || features == nullptr) {
+    error_reporter->Report("Model input tensor or feature window is null");
     return false;
   }
   if (!IsSupportedInputType(input->type)) {
@@ -78,8 +82,9 @@ bool FillModelInput(TfLiteTensor* input,
     return false;
   }
 
-  const int feature_length = ElementCount(input);
-  if (feature_length <= 0 || feature_length > kMaxFeatureLength) {
+  const int expected_length = ElementCount(input);
+  if (feature_length <= 0 || feature_length > kMaxFeatureLength ||
+      feature_length != expected_length) {
     error_reporter->Report("Unsupported input feature length: %d (max=%d)",
                            feature_length, kMaxFeatureLength);
     return false;
@@ -95,23 +100,14 @@ bool FillModelInput(TfLiteTensor* input,
     return false;
   }
 
-  if (!ReadImu(error_reporter, feature_buffer, feature_length, false)) {
-    ESP_LOGD(kTag,
-             "waiting for IMU window: accel[g]=%.3f,%.3f,%.3f "
-             "gyro[dps]=%.3f,%.3f,%.3f",
-             g_latest_accel_x, g_latest_accel_y, g_latest_accel_z,
-             g_latest_gyro_x, g_latest_gyro_y, g_latest_gyro_z);
-    return false;
-  }
-
   if (input->type == kTfLiteFloat32) {
     for (int i = 0; i < feature_length; ++i) {
-      input->data.f[i] = feature_buffer[i];
+      input->data.f[i] = features[i];
     }
   } else if (input->type == kTfLiteInt8) {
-    QuantizeToInt8(feature_buffer, feature_length, input);
+    QuantizeToInt8(features, feature_length, input);
   } else {
-    QuantizeToUInt8(feature_buffer, feature_length, input);
+    QuantizeToUInt8(features, feature_length, input);
   }
 
   ESP_LOGD(kTag,

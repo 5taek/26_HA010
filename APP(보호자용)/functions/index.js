@@ -20,8 +20,12 @@ const retryableMessagingCodes = new Set([
 ]);
 
 function equalToken(actual, expected) {
-  const left = Buffer.from(actual || "");
-  const right = Buffer.from(expected || "");
+  if (typeof actual !== "string" || actual.trim().length === 0 ||
+      typeof expected !== "string" || expected.trim().length === 0) {
+    return false;
+  }
+  const left = Buffer.from(actual);
+  const right = Buffer.from(expected);
   return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
@@ -125,6 +129,10 @@ exports.reportFall = onRequest(
       let configuredTokens;
       try {
         configuredTokens = JSON.parse(deviceTokens.value());
+        if (configuredTokens === null || typeof configuredTokens !== "object" ||
+            Array.isArray(configuredTokens)) {
+          throw new Error("Device tokens must be an object");
+        }
       } catch {
         response.status(500).json({ok: false, error: "invalid server config"});
         return;
@@ -136,12 +144,57 @@ exports.reportFall = onRequest(
         response.status(400).json({ok: false, error: "invalid payload"});
         return;
       }
-      if (!equalToken(request.get("X-Device-Token"), configuredTokens[deviceId])) {
+      // Older firmware omits eventId; it remains supported during rollout.
+      const requestEventId = body.eventId;
+      if (requestEventId !== undefined && (typeof requestEventId !== "string" ||
+          !/^[A-Za-z0-9_-]{1,128}$/.test(requestEventId))) {
+        response.status(400).json({ok: false, error: "invalid eventId"});
+        return;
+      }
+      if (body.eventSequence !== undefined &&
+          (!Number.isSafeInteger(body.eventSequence) || body.eventSequence < 1)) {
+        response.status(400).json({ok: false, error: "invalid eventSequence"});
+        return;
+      }
+      if (!Object.prototype.hasOwnProperty.call(configuredTokens, deviceId) ||
+          !equalToken(request.get("X-Device-Token"), configuredTokens[deviceId])) {
         response.status(401).json({ok: false, error: "unauthorized"});
         return;
       }
 
       const db = getFirestore();
+      const eventRef = requestEventId === undefined ?
+        db.collection("fall_events").doc() :
+        db.collection("fall_events").doc(crypto.createHash("sha256")
+            .update(JSON.stringify([deviceId, requestEventId])).digest("hex"));
+      const payloadHash = crypto.createHash("sha256").update(JSON.stringify({
+        state, reason: body.reason ?? null, score: body.score ?? null,
+        deviceTimeMs: body.deviceTimeMs ?? null,
+        eventSequence: body.eventSequence ?? null,
+      })).digest("hex");
+      function replyToDuplicate(saved) {
+        if (saved.payloadHash !== payloadHash) {
+          response.status(409).json({ok: false, error: "eventId payload conflict"});
+        } else {
+          response.status(200).json({ok: true, eventId: eventRef.id, state,
+            duplicate: true, sentCount: saved.notificationSentCount || 0});
+        }
+      }
+      // A retry remains acknowledgeable even if the device's link changed
+      // after the original event was committed.
+      if (requestEventId !== undefined) {
+        try {
+          const existing = await eventRef.get();
+          if (existing.exists) {
+            replyToDuplicate(existing.data());
+            return;
+          }
+        } catch (error) {
+          console.error("reportFall: duplicate lookup failed", error);
+          response.status(500).json({ok: false, error: "storage read failed"});
+          return;
+        }
+      }
       const deviceRef = db.collection("devices").doc(deviceId);
       const deviceSnapshot = await deviceRef.get();
       if (!deviceSnapshot.exists) {
@@ -170,9 +223,10 @@ exports.reportFall = onRequest(
       const score = rawScore === null ? null : Math.min(1, Math.max(0, rawScore));
 
       const info = metadata(state);
-      const eventRef = db.collection("fall_events").doc();
       const event = {
         eventId: eventRef.id, deviceId, patientId, guardianUids, state,
+        requestEventId: requestEventId ?? null, payloadHash,
+        eventSequence: body.eventSequence ?? null,
         severity: info.severity, status: info.status, source: "esp32",
         reason, score,
         location: device.latestLocation || null,
@@ -180,20 +234,31 @@ exports.reportFall = onRequest(
         deviceTimeMs: Number.isFinite(body.deviceTimeMs) ? body.deviceTimeMs : null,
         notificationStatus: state === "danger_fall" ? "pending" : "not_applicable",
       };
-      const batch = db.batch();
-      batch.set(eventRef, event);
-      for (const uid of guardianUids) {
-        batch.set(db.collection("users").doc(uid).collection("fall_events")
-            .doc(eventRef.id), {...event, sourceEventPath: eventRef.path});
-      }
-      batch.set(deviceRef, {
-        latestState: state, latestSeverity: info.severity,
-        latestScore: event.score, latestSource: "esp32",
-        lastSeenAt: FieldValue.serverTimestamp(),
-      }, {merge: true});
-
       try {
-        await batch.commit();
+        const duplicate = await db.runTransaction(async (transaction) => {
+          const existing = await transaction.get(eventRef);
+          if (existing.exists) return existing.data();
+          const latestDevice = await transaction.get(deviceRef);
+          const lastSequence = latestDevice.get("latestEventSequence");
+          transaction.set(eventRef, event);
+          for (const uid of guardianUids) {
+            transaction.set(db.collection("users").doc(uid).collection("fall_events")
+                .doc(eventRef.id), {...event, sourceEventPath: eventRef.path});
+          }
+          if (body.eventSequence === undefined || !Number.isSafeInteger(lastSequence) ||
+              body.eventSequence > lastSequence) transaction.set(deviceRef, {
+            latestState: state, latestSeverity: info.severity,
+            latestScore: event.score, latestSource: "esp32",
+            lastSeenAt: FieldValue.serverTimestamp(),
+            ...(body.eventSequence === undefined ? {} :
+              {latestEventSequence: body.eventSequence}),
+          }, {merge: true});
+          return null;
+        });
+        if (duplicate) {
+          replyToDuplicate(duplicate);
+          return;
+        }
       } catch (error) {
         console.error("reportFall: Firestore write failed", error);
         response.status(500).json({ok: false, error: "storage write failed"});
