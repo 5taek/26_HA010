@@ -84,9 +84,6 @@ ESP32-S3가 두 상태를 Cloud Function으로 직접 전송한다. 두 상태 �
 Firestore에 기록되며 `danger_fall`만 FCM 긴급 푸시를 발생시킨다.
 이 프로젝트는 NVS 영구 보관과 `eventId`/`eventSequence`를 사용한다.
 HTTP 실패는 횟수 제한으로 버리지 않고 1~30초 간격으로 재시도한다.
-보관 용량·전원 차단·푸시 보장 범위는 [이벤트 전달](../Care_app/EVENT_DELIVERY.md)을 참조한다.
-`FD_KWS`와 `Fall_detection`은 RAM 큐/최대 3회 전송이며 이 영구 보관 기능과
-방위각이 없다. 정지 억제는 세 프로젝트 모두 없다.
 
 ## 키워드 인식(KWS)
 
