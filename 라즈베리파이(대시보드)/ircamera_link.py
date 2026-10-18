@@ -1,6 +1,7 @@
 import socket
 import struct
 import threading
+import time
 
 import serial
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -56,34 +57,70 @@ CMD_GUIDE_STAIRS = 0x09
 CMD_FALL_ALERT_START = 0x0A
 CMD_FALL_ALERT_STOP = 0x0B
 
+# 키워드스파팅 인식 실패/timeout 시 "다시 말씀해주세요" 재생 트리거(2026-10-16, 페이로드 없음, 단독 1바이트).
+# 예전엔 ESP32에 클립이 없어서 이어폰으로만 냈음 - 지금은 ESP32 스피커 + voice_cue로 이어폰 둘 다.
+CMD_RETRY_PROMPT = 0x0C
+
 PKT_OBSTACLE = 0xB0
 PKT_BUS = 0xB1
 PKT_BRAILLE = 0xB2
-# ESP32가 버스/점자블록 모드에서 스스로 장애물모드 복귀 시점을 판단해 보내는 신호(페이로드 없음, 2026-08-26).
-# 이게 오면 RPi 쪽 30초 revert 타이머(BUS_MODE_TIMEOUT_S/BRAILLE_MODE_TIMEOUT_S)보다 먼저 즉시 복귀시킨다 -
-# 그 타이머는 ESP32가 이 신호조차 못 보내는 이상 상황 대비 안전망으로만 남겨둔다.
+# ESP32가 장애물모드에 진입할 때마다(버스/점자블록에서 복귀, 부팅 포함) 보내는 신호(페이로드 없음, 2026-08-26).
 PKT_REVERT = 0xB3
+# 정류장 체크 결과(버스 후보, 2026-10-16). 버스모드 명령 후 ESP32가 버스모드에 들어가기 직전에 1번만 보낸다:
+#   [count 1B] + count x ([len 1B][노선번호 UTF-8][도착초 uint16 LE])
+# count=0 = 도착 예정 버스 없음(ESP32가 "도착버스없음" 재생, 버스모드 진입 안 함).
+# 도착초 0xFFFF = 모름(GPS/정류장DB 없어서 고정 리스트 폴백 - ESP32도 후보 안내 음성 안 냄).
+PKT_BUS_CANDIDATES = 0xB4
+BUS_ARR_UNKNOWN = 0xFFFF
+# ESP32 voice.bin에 클립이 있는 노선번호(voice_clips.h) - ESP32는 이 노선들만 소리 내서 안내한다.
+BUS_VOICE_KEYS = {"937", "503", "410", "410-1", "북구2"}
 
 OBJECT_NAMES = {0x01: "자전거", 0x02: "킥보드", 0x03: "볼라드", 0x04: "사람", 0x05: "미상"}
 OBJECT_CODES = {name: code for code, name in OBJECT_NAMES.items()}  # CMD_OBSTACLE_CONFIRM 페이로드용 역매핑
 DIRECTION_NAMES = {0x01: "왼쪽", 0x02: "중앙", 0x03: "오른쪽"}
+# 점자블록(0xB2) dir 바이트도 같은 코드를 쓴다(0=없음/미상 - main.cpp send_braille_result, 2026-10-16).
+# 근접확정 시 ESP32가 재생하는 클립 - left/right 외에는 전부 "정면"(main.cpp와 동일).
+BRAILLE_NEAR_VOICE_KEYS = {0x01: "왼쪽에점자블록", 0x03: "오른쪽에점자블록"}
+BRAILLE_NEAR_VOICE_DEFAULT = "정면에점자블록"
+
+# voice_cue로 내보내는 음성 클립 키 - ircamera main.cpp의 voice_clips.h 키와 같고, sew/data/<키>.wav와도
+# 같다. ESP32가 자기 스피커로 재생하는 시점에 RPi(이어폰)도 같이 재생하기 위함(earphone_audio.py).
+GUIDE_VOICE_KEYS = {
+    GUIDE_VOICE_ENTER: "길안내모드전환",
+    GUIDE_VOICE_SCHOOL: "학교",
+    GUIDE_VOICE_BUS_STOP: "버스정류장",
+    GUIDE_VOICE_CONFIRM: "버스정류장으로길안내를시작합니다",
+}
+# 페이로드 없는 단독 1바이트 명령 중 ESP32가 받는 즉시 클립을 재생하는 것들.
+# 횡단보도(0x08)는 wav가 없어서 ESP32도 재생 안 함 -> 여기서도 제외. 낙상 알림(0x0A/0x0B)도 클립 아님.
+SIMPLE_CMD_VOICE_KEYS = {
+    CMD_GUIDE_ARRIVED: "목적지에도착했습니다",
+    CMD_EMERGENCY_ALERT: "긴급상황발생119신고요청",
+    CMD_GUIDE_TURN_LEFT: "좌회전",
+    CMD_GUIDE_TURN_RIGHT: "우회전",
+    CMD_GUIDE_STAIRS: "계단",
+    CMD_RETRY_PROMPT: "다시말씀해주세요",
+}
+# ESP32가 모드에 실제로 들어가면서 재생하는 클립(main.cpp enter_mode()).
+MODE_ENTER_VOICE_KEYS = {
+    "obstacle": "장애물모드전환",
+    "bus_ocr": "버스탐지모드전환",
+    "braille": "점자블록모드전환",
+}
 
 # ESP32가 버스/점자블록 모드에서 장애물모드로 복귀할 때가 됐는지는 전적으로 ESP32가 판단한다
-# (몇 번 매칭됐는지, 정류장 게이팅에서 몇 대를 더 기다려야 하는지 등은 RPi가 알 수 없는
-# ESP32쪽 상태임 - smartcane 저장소 SEW 브랜치 main.cpp의 s_bus_target_count/matched_count
-# 참고). 그래서 RPi는 matched=1/near=1이 와도 자체 판단으로 장애물모드로 되돌리지 않고,
-# ESP32가 실제로 장애물모드에 진입했을 때 보내는 PKT_REVERT(0xB3)만 신뢰한다
-# (2026-08-28 수정 - 예전엔 matched=1이 오면 RPi가 자체 타이머로 먼저 되돌려버려서, ESP32가
-# "버스 1/2대 매칭 - 버스모드 재진입"으로 아직 버스모드를 유지 중인데도 화면이 장애물모드로
-# 먼저 바뀌는 버그가 있었다).
-#
-# 아래 타임아웃은 ESP32가 PKT_REVERT조차 못 보내는 완전한 통신 장애 상황을 대비한
-# 최후의 안전망일 뿐이다 - 정상 상황에서는 항상 PKT_REVERT가 먼저 와서 이 타이머를 취소시킨다.
-# main.cpp의 kBusModeTimeoutUs / kBrailleModeTimeoutUs와 반드시 값을 맞출 것 — ESP 쪽이
-# 임시 진단용으로 5초 -> 30초로 늘어난 상태라(2026-08-15) 여기도 같이 30으로 맞춰둠.
-# ESP 쪽이 5초로 되돌아가면 여기도 같이 되돌릴 것.
-BUS_MODE_TIMEOUT_S = 30
-BRAILLE_MODE_TIMEOUT_S = 30
+# (몇 번 매칭됐는지, 정류장 게이팅에서 몇 대를 더 기다려야 하는지, 타임아웃 등은 RPi가 알 수 없는
+# ESP32쪽 상태임 - smartcane 저장소 SEW 브랜치 main.cpp의 s_bus_target_count/matched_count,
+# kBusModeTimeoutUs 참고). 그래서 RPi는 자체 타이머 없이 ESP32 패킷만 보고 화면을 되돌린다
+# (2026-10-16 - 예전 30초 안전망 타이머는 ESP32 쪽 타임아웃이 60초로 늘면서 화면을 먼저 되돌려버리는
+# 문제가 생겨서 제거):
+#   - PKT_REVERT(0xB3): ESP32가 장애물모드에 진입함 -> 즉시 복귀
+#   - PKT_OBSTACLE(0xB0): ESP32는 장애물모드에서만 이걸 보낸다. 버스/점자블록 명령을 보냈는데도
+#     이게 계속 오면 ESP32가 모드에 안 들어간 것(버스: 정류장 게이팅에서 도착 버스 없음 / 명령 유실)
+#     -> 복귀. 단 명령 직후엔 ESP32가 명령을 처리하기 전에 이미 보낸 0xB0이 올 수 있어서
+#     MODE_CMD_GRACE_S 동안은 무시한다.
+#   - 시리얼 끊김: 복귀
+MODE_CMD_GRACE_S = 2.0
 
 # 영상 스트림(길이 헤더 + JPEG) 관련 상수.
 # ESP32가 모드 전환 중 프레임 전송을 멈추거나 프레이밍이 깨진 데이터를 보내면
@@ -108,8 +145,11 @@ class IrCameraLink(QObject):
     frame_received = Signal(QImage)
     obstacle_detected = Signal(str, str, int)   # object_name, direction_name, confidence(0~100)
     bus_result = Signal(str, int, bool)          # text, confidence(0~100), matched(사전 후보 확정 여부)
-    braille_result = Signal(bool, int, bool)     # present, confidence(0~100), near
+    bus_candidates = Signal(list)                # [(노선번호, 도착초 또는 None)], 빈 리스트 = 도착 예정 버스 없음
+    braille_result = Signal(bool, int, bool, str)  # present, confidence(0~100), near, direction_name("왼쪽"/"중앙"/"오른쪽"/"-")
     mode_changed = Signal(str)                   # "obstacle" | "bus_ocr" | "braille"
+    # ESP32가 지금 자기 스피커로 재생하는(했을) 음성 클립 키. 백그라운드 스레드에서 emit됨.
+    voice_cue = Signal(str)
     serial_connected = Signal(bool)
     video_client_connected = Signal(bool)
 
@@ -123,10 +163,15 @@ class IrCameraLink(QObject):
 
         self._ser = None
         self._ser_lock = threading.Lock()
-        self._revert_timer = None
-        self._active_mode = None
+        self._active_mode = None   # RPi가 명령해서 화면에 띄운 모드("bus_ocr"/"braille"), 장애물이면 None
+        self._mode_cmd_at = 0.0    # 마지막 버스/점자블록 명령 시각(time.monotonic) - MODE_CMD_GRACE_S 판정용
         self._stop = threading.Event()
         self._last_gps = None  # (lat, lon) or None — set_gps_fix()로 갱신, 버스모드 게이팅용
+        # ESP32가 받은 패킷으로 추정한 ESP32의 실제 모드. _active_mode(RPi가 명령한 모드, 화면용)와 별개다 -
+        # 명령을 보내도 ESP32가 안 들어갈 수 있어서(버스: 정류장 게이팅에서 도착 버스 없음 /
+        # 이미 그 모드였음 / 전송 실패) 모드 전환 음성은 이 값이 실제로 바뀔 때만 낸다.
+        # None = 아직 모름(연결 직후) - 첫 패킷으로 조용히 채우고 소리는 안 낸다.
+        self._esp_mode = None
 
         self._frame_lock = threading.Lock()
         self._latest_frame = None
@@ -154,8 +199,6 @@ class IrCameraLink(QObject):
 
     def stop(self):
         self._stop.set()
-        if self._revert_timer:
-            self._revert_timer.cancel()
         if self._display_timer:
             self._display_timer.stop()
 
@@ -170,8 +213,8 @@ class IrCameraLink(QObject):
         # ser.write()가 (ESP32가 UART를 못 받아주는 동안) 블로킹되더라도 이 메서드는
         # 버튼 클릭 슬롯 등 GUI 메인 스레드에서 호출되므로, 여기서 막히면 창 전체가 먹통이 된다.
         self._active_mode = "bus_ocr"
+        self._mode_cmd_at = time.monotonic()
         self.mode_changed.emit("bus_ocr")
-        self._arm_revert_timer(BUS_MODE_TIMEOUT_S)
         # main.cpp(2026-08-23)가 MODE_CMD_BUS 뒤에 lat/lon(float32 LE 4B씩, 총 8B)이
         # 이어붙어 오는 걸 기대하도록 바뀌어서(정류장 게이팅용), 커맨드 바이트와 GPS
         # 페이로드를 한 번의 write()로 같이 보낸다. fix가 아직 없으면 0x01만 보내고,
@@ -180,8 +223,8 @@ class IrCameraLink(QObject):
 
     def request_braille_mode(self):
         self._active_mode = "braille"
+        self._mode_cmd_at = time.monotonic()
         self.mode_changed.emit("braille")
-        self._arm_revert_timer(BRAILLE_MODE_TIMEOUT_S)
         threading.Thread(target=self._send_mode_byte, args=(MODE_BRAILLE,), daemon=True).start()
 
     # ---------------- 장애물 확인 트리거 (TOF+AI모드 방향 일치 시 dashboard.py가 호출) ----------------
@@ -194,6 +237,8 @@ class IrCameraLink(QObject):
             if self._ser and self._ser.is_open:
                 try:
                     self._ser.write(payload)
+                    if object_code in OBJECT_NAMES and object_code != OBJECT_CODES["미상"]:
+                        self.voice_cue.emit(OBJECT_NAMES[object_code])
                 except Exception as e:
                     print(f"[ircamera] 장애물 확인 트리거 전송 실패: {e}")
             else:
@@ -209,6 +254,8 @@ class IrCameraLink(QObject):
             if self._ser and self._ser.is_open:
                 try:
                     self._ser.write(payload)
+                    if subcode in GUIDE_VOICE_KEYS:
+                        self.voice_cue.emit(GUIDE_VOICE_KEYS[subcode])
                 except Exception as e:
                     print(f"[ircamera] 길안내 음성 트리거 전송 실패: {e}")
             else:
@@ -241,12 +288,9 @@ class IrCameraLink(QObject):
     def send_fall_alert_stop(self):
         threading.Thread(target=self._send_mode_byte, args=(CMD_FALL_ALERT_STOP,), daemon=True).start()
 
-    def _arm_revert_timer(self, timeout_s):
-        if self._revert_timer:
-            self._revert_timer.cancel()
-        self._revert_timer = threading.Timer(timeout_s, self._revert_to_obstacle)
-        self._revert_timer.daemon = True
-        self._revert_timer.start()
+    # ---------------- 키워드 인식 실패 안내 (dashboard.py의 on_keyword_recognized에서 호출) ----------------
+    def send_retry_prompt(self):
+        threading.Thread(target=self._send_mode_byte, args=(CMD_RETRY_PROMPT,), daemon=True).start()
 
     def _revert_to_obstacle(self):
         self._active_mode = None
@@ -257,6 +301,8 @@ class IrCameraLink(QObject):
             if self._ser and self._ser.is_open:
                 try:
                     self._ser.write(bytes([value]))
+                    if value in SIMPLE_CMD_VOICE_KEYS:
+                        self.voice_cue.emit(SIMPLE_CMD_VOICE_KEYS[value])
                 except Exception as e:
                     print(f"[ircamera] 모드 전송 실패: {e}")
             else:
@@ -286,6 +332,7 @@ class IrCameraLink(QObject):
                     # write_timeout을 안 주면 ser.write()가 무한 블로킹될 수 있는데, 그러면
                     # 그 write를 감싼 _ser_lock도 계속 잡혀 있어서 여기(재연결 시도)까지 같이 멈춘다.
                     self._ser = serial.Serial(self.serial_port, self.serial_baud, timeout=1, write_timeout=1)
+                self._esp_mode = None  # 끊긴 사이 ESP32 모드가 바뀌었을 수 있음 - 다시 첫 패킷으로 채운다
                 self.serial_connected.emit(True)
                 print(f"[ircamera] 시리얼 연결됨: {self.serial_port}")
                 self._read_packets()
@@ -293,6 +340,10 @@ class IrCameraLink(QObject):
                 print(f"[ircamera] 시리얼 연결 실패: {e}")
                 self.serial_connected.emit(False)
                 self._stop.wait(2.0)
+            finally:
+                # 끊긴 동안 ESP32 모드를 알 수 없고 0xB3도 못 받으니, 버스/점자블록 화면에 갇히지 않게 되돌린다
+                if self._active_mode is not None:
+                    self._revert_to_obstacle()
 
     def _read_packets(self):
         ser = self._ser
@@ -310,6 +361,8 @@ class IrCameraLink(QObject):
                     self._handle_braille(ser)
                 elif msg_type == PKT_REVERT:
                     self._handle_revert()
+                elif msg_type == PKT_BUS_CANDIDATES:
+                    self._handle_bus_candidates(ser)
                 else:
                     # 0xB0~0xB2가 아니면 ESP32의 esp_log_set_vprintf 후킹으로 얹혀오는
                     # 텍스트 로그 줄이다("I (12345) ircam: ..." 등). 개행까지 읽어서 출력만 한다 —
@@ -334,6 +387,11 @@ class IrCameraLink(QObject):
         object_code, direction_code, confidence = payload[0], payload[1], payload[2]
         obj_name = OBJECT_NAMES.get(object_code, "미상")
         dir_name = DIRECTION_NAMES.get(direction_code, "-")
+        self._note_esp_mode("obstacle", announce=False)  # 장애물모드 진입 안내는 0xB3에서만
+        # 버스/점자블록을 명령했는데 0xB0이 계속 옴 = ESP32가 그 모드에 안 들어감(위 MODE_CMD_GRACE_S 주석 참고)
+        if self._active_mode is not None and time.monotonic() - self._mode_cmd_at > MODE_CMD_GRACE_S:
+            print(f"[ircamera] {self._active_mode} 명령 후에도 ESP32가 장애물모드 - 화면 복귀")
+            self._revert_to_obstacle()
         self.obstacle_detected.emit(obj_name, dir_name, confidence)
 
     def _handle_bus(self, ser):
@@ -346,7 +404,41 @@ class IrCameraLink(QObject):
         text = self._read_exact(ser, length).decode("utf-8", errors="replace") if length else ""
         confidence = self._read_exact(ser, 1)[0]
         matched = bool(self._read_exact(ser, 1)[0])
+        # 0xB1은 ESP32가 버스모드일 때만 보낸다 - 명령 후 첫 0xB1 = 실제로 버스모드에 들어갔다는 뜻.
+        # (정류장 게이팅에서 도착 버스가 없으면 ESP32는 진입 안 하고 0xB1도 안 옴 -> 이어폰도 조용.)
+        # 한계: 버스 1대 매칭 후 같은 버스모드로 재진입할 때 ESP32가 다시 내는 안내는 여기서 못 잡는다.
+        self._note_esp_mode("bus_ocr", announce=True)
+        if matched and text in BUS_VOICE_KEYS:
+            self.voice_cue.emit(text)  # ESP32가 매칭 순간 노선번호를 재생함(main.cpp queue_voice_clip(s_bus_last_match))
         self.bus_result.emit(text, confidence, matched)
+
+    def _handle_bus_candidates(self, ser):
+        count = self._read_exact(ser, 1)[0]
+        candidates = []
+        for _ in range(count):
+            length = self._read_exact(ser, 1)[0]
+            route = self._read_exact(ser, length).decode("utf-8", errors="replace")
+            arr = struct.unpack("<H", self._read_exact(ser, 2))[0]
+            candidates.append((route, None if arr == BUS_ARR_UNKNOWN else arr))
+
+        if not candidates:
+            # ESP32는 버스모드에 안 들어가고 장애물모드 그대로 - 0xB0 유예시간(MODE_CMD_GRACE_S)
+            # 추정을 기다리지 않고 바로 화면을 되돌린다.
+            self.voice_cue.emit("도착버스없음")
+            if self._active_mode == "bus_ocr":
+                self._revert_to_obstacle()
+        else:
+            # main.cpp report_api_bus_candidates()와 같은 순서: 클립 있는 노선들 -> "도착예정"
+            # (도착초를 모르는 고정 리스트 폴백이면 ESP32도 조용함). 바로 뒤에 ESP32가
+            # enter_mode(BUS)로 "버스탐지모드전환"을 내므로 여기서 모드도 같이 표시해둔다.
+            if all(arr is not None for _, arr in candidates):
+                voiced = [route for route, _ in candidates if route in BUS_VOICE_KEYS]
+                for route in voiced:
+                    self.voice_cue.emit(route)
+                if voiced:
+                    self.voice_cue.emit("도착예정")
+            self._note_esp_mode("bus_ocr", announce=True)
+        self.bus_candidates.emit(candidates)
 
     def _handle_log_line(self, ser, first_byte):
         # 결과 패킷과 달리 길이가 정해져 있지 않으므로, 개행이 오거나 1초(시리얼 timeout)
@@ -366,20 +458,33 @@ class IrCameraLink(QObject):
             print(f"[ircamera:fw] {text}")
 
     def _handle_braille(self, ser):
+        # [present 1B][conf 1B][near 1B][dir 1B] (2026-10-16, dir 추가로 4 -> 5바이트).
         # 점자블록모드 동안 매 사이클(~200ms) 전송됨 — near(충분히 근접)가 와도 장애물모드로
         # 즉시 돌아가지 않는다(버스모드와 동일한 이유 - _handle_bus 참고). 실제로 장애물모드에
         # 진입했을 때 오는 PKT_REVERT(0xB3)만 보고 되돌린다.
-        payload = self._read_exact(ser, 3)
-        present, confidence, near = bool(payload[0]), payload[1], bool(payload[2])
-        self.braille_result.emit(present, confidence, near)
+        payload = self._read_exact(ser, 4)
+        present, confidence, near, dir_code = bool(payload[0]), payload[1], bool(payload[2]), payload[3]
+        self._note_esp_mode("braille", announce=True)  # 0xB2도 점자블록모드일 때만 옴 - _handle_bus와 같은 원리
+        if near:
+            # ESP32는 near가 오는 그 사이클에 방향 안내를 재생하고 1초 뒤 장애물모드로 복귀한다 -> 한 번만 옴
+            self.voice_cue.emit(BRAILLE_NEAR_VOICE_KEYS.get(dir_code, BRAILLE_NEAR_VOICE_DEFAULT))
+        self.braille_result.emit(present, confidence, near, DIRECTION_NAMES.get(dir_code, "-"))
 
     def _handle_revert(self):
         # 버스/점자블록 모드에서 장애물모드로 실제로 돌아갈 시점은 ESP32만 알 수 있다
         # (매칭 횟수, 정류장 게이팅 등 RPi가 모르는 상태에 달려있음) - 그래서 matched=1/near=1
         # 자체는 무시하고, 이 신호가 왔을 때만 안전망 타이머를 취소하고 되돌린다.
-        if self._revert_timer:
-            self._revert_timer.cancel()
+        # 0xB3은 ESP32가 enter_mode(OBSTACLE)할 때마다(부팅 포함) 보내고, 그때 항상 "장애물모드전환"을
+        # 재생한다 - 그래서 이전 모드를 모르거나 이미 장애물이었어도 그대로 따라 낸다.
+        self._esp_mode = "obstacle"
+        self.voice_cue.emit(MODE_ENTER_VOICE_KEYS["obstacle"])
         self._revert_to_obstacle()
+
+    def _note_esp_mode(self, mode, announce):
+        prev = self._esp_mode
+        self._esp_mode = mode
+        if announce and prev is not None and prev != mode:
+            self.voice_cue.emit(MODE_ENTER_VOICE_KEYS[mode])
 
     # ---------------- TCP 영상 서버 ----------------
     def _tcp_server_loop(self):

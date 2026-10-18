@@ -15,7 +15,8 @@ MAX_SPEED_MPS = 40.0  # 도보/버스 이동을 감안한 여유치(≈144km/h) 
 
 DEFAULT_HDOP = 2.0  # GGA 문장에 HDOP 필드가 비어있을 때(드묾)만 쓰는 보수적 기본값
 BASE_UERE_M = 5.0  # 단독(SPS) GPS의 HDOP=1 기준 대략적 사용자등가거리오차(m) - 흔히 쓰이는 근사치
-PROCESS_NOISE_STD_MPS = 1.3  # 칼만 필터 프로세스 노이즈(m/s 표준편차) - 도보 이동 정도의 불확실성을 매 tick 허용
+ACCEL_NOISE_STD_MPS2 = 0.5  # 보행 가속도 불확실성(m/s^2). 0.3~1.0 사이에서 실측으로 조정 - 작을수록 부드럽고 반응이 느림
+MAX_SPEED_EST_MPS = 3.0  # 필터가 추정하는 속도의 상한(m/s) - 도보 기준, 글리치로 속도 추정이 튀는 것 방지
 
 METERS_PER_DEG_LAT = 111320.0  # 위도 1도당 거리(m) - 위도에 거의 무관하게 일정
 
@@ -29,39 +30,53 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(math.sqrt(a))
 
 
-class _KalmanAxis:
-    """1축(동/북 방향, 미터 단위)용 1차원 칼만 필터.
+class _KalmanAxisCV:
+    """1축(동/북 방향, 미터 단위)용 등속(constant velocity) 칼만 필터. 상태 = [위치(m), 속도(m/s)].
 
-    고정 개수 이동평균과 달리 추정 분산(self.variance)이 매 갱신마다 계속 줄어들어
-    정지 상태에서 시간이 지날수록 더 정밀하게 수렴한다. 측정 노이즈(measurement_std_m)를
-    HDOP에서 추정해 그대로 게인 계산에 반영하므로, 위성 배치가 나쁜 순간의 픽스는
-    자동으로 덜 반영된다.
+    위치만 추정하던 이전 필터는 걸을 때 추정 위치가 실제보다 4~9m 뒤처졌다(속도를 모르기 때문).
+    속도를 함께 추정하면 일정한 속도로 걷는 동안 지연이 거의 0이 된다. 측정 노이즈
+    (measurement_std_m)는 HDOP에서 추정해 게인에 그대로 반영하므로, 위성 배치가 나쁜 순간의
+    픽스는 자동으로 덜 반영된다. 정지 상태에서는 속도 추정이 0으로 수렴하고 위치 분산이 계속 줄어든다.
     """
 
-    def __init__(self, process_noise_std_mps: float):
-        self._process_noise_std_mps = process_noise_std_mps
-        self.estimate_m = None
-        self.variance = None
+    def __init__(self, accel_std_mps2: float):
+        self._q = accel_std_mps2 ** 2
+        self.p = None  # 위치 추정(m)
+        self.v = 0.0   # 속도 추정(m/s)
+        self.P = None  # 2x2 공분산
 
-    def update(self, measurement_m: float, measurement_std_m: float, dt_s: float) -> float:
-        measurement_variance = measurement_std_m ** 2
-        if self.estimate_m is None:
-            self.estimate_m = measurement_m
-            self.variance = measurement_variance
-            return self.estimate_m
+    def update(self, z: float, meas_std_m: float, dt: float) -> float:
+        R = meas_std_m ** 2
+        if self.p is None:
+            self.p, self.v = z, 0.0
+            self.P = [[R, 0.0], [0.0, 1.0]]
+            return self.p
 
-        # 예측: 마지막 갱신 이후 경과 시간만큼 도보 이동 불확실성을 더함
-        predicted_variance = self.variance + (self._process_noise_std_mps * max(dt_s, 0.0)) ** 2
-
-        # 갱신: 칼만 게인으로 예측치와 새 측정치를 신뢰도 비율대로 섞음
-        gain = predicted_variance / (predicted_variance + measurement_variance)
-        self.estimate_m += gain * (measurement_m - self.estimate_m)
-        self.variance = (1.0 - gain) * predicted_variance
-        return self.estimate_m
+        dt = max(dt, 0.0)
+        q = self._q
+        (P00, P01), (P10, P11) = self.P
+        # 예측 (F = [[1, dt], [0, 1]], 가속도 잡음 q)
+        p = self.p + self.v * dt
+        v = self.v
+        n00 = P00 + dt * (P01 + P10) + dt * dt * P11 + q * dt ** 4 / 4
+        n01 = P01 + dt * P11 + q * dt ** 3 / 2
+        n10 = P10 + dt * P11 + q * dt ** 3 / 2
+        n11 = P11 + q * dt * dt
+        # 갱신 (H = [1, 0])
+        S = n00 + R
+        k0, k1 = n00 / S, n10 / S
+        y = z - p
+        p += k0 * y
+        v = max(-MAX_SPEED_EST_MPS, min(MAX_SPEED_EST_MPS, v + k1 * y))
+        self.P = [[(1 - k0) * n00, (1 - k0) * n01],
+                  [n10 - k1 * n00, n11 - k1 * n01]]
+        self.p, self.v = p, v
+        return p
 
 
 class GPSLink(QObject):
     fix_changed = Signal(bool, float, float)  # connected(유효 픽스 여부), 위도, 경도
+    fix_detail = Signal(bool, float, float, float)  # connected, 위도, 경도, HDOP(모르면 0) - 길안내 보드 전송용
 
     def __init__(self, serial_port=DEFAULT_SERIAL_PORT, serial_baud=DEFAULT_SERIAL_BAUD, parent=None):
         super().__init__(parent)
@@ -77,8 +92,8 @@ class GPSLink(QObject):
         # 오차 추정이 왜곡된다.
         self._ref_lat = None
         self._ref_lon = None
-        self._east_filter = _KalmanAxis(PROCESS_NOISE_STD_MPS)
-        self._north_filter = _KalmanAxis(PROCESS_NOISE_STD_MPS)
+        self._east_filter = _KalmanAxisCV(ACCEL_NOISE_STD_MPS2)
+        self._north_filter = _KalmanAxisCV(ACCEL_NOISE_STD_MPS2)
         self._last_update_t = None
 
     def start(self):
@@ -129,6 +144,7 @@ class GPSLink(QObject):
             lat, lon = self._filtered(msg.latitude, msg.longitude, hdop)
             self._connected = True
             self.fix_changed.emit(True, lat, lon)
+            self.fix_detail.emit(True, lat, lon, hdop if hdop is not None else 0.0)
 
     def _parse_hdop(self, msg):
         try:
@@ -192,3 +208,4 @@ class GPSLink(QObject):
             return
         self._connected = False
         self.fix_changed.emit(False, 0.0, 0.0)
+        self.fix_detail.emit(False, 0.0, 0.0, 0.0)

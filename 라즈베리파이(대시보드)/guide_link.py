@@ -1,4 +1,5 @@
 import threading
+import time
 
 import serial
 from PySide6.QtCore import QObject, Signal
@@ -30,7 +31,7 @@ CMD_DEST_BUS_STOP = 0x01
 CMD_DEST_SCHOOL = 0x02
 # GPS는 커맨드 바이트 없이 평문 줄로 보낸다("GPS,<lat>,<lon>\n") - _write_gps() 참고.
 
-GPS_UPDATE_INTERVAL_S = 1.0
+GPS_MAX_AGE_S = 2.0  # 안내 시작 때 사전 전송할 GPS가 이보다 오래됐으면 보내지 않는다
 
 
 class GuideLink(QObject):
@@ -53,9 +54,7 @@ class GuideLink(QObject):
         self._ser_lock = threading.Lock()
         self._stop = threading.Event()
 
-        self._gps_timer = None
-        self._last_lat = None
-        self._last_lon = None
+        self._last = None  # (lat, lon, hdop, time.monotonic()) - 튜플 하나라 읽는 쪽에서 값이 어긋나지 않음
 
     # ---------------- 시작/종료 ----------------
     def start(self):
@@ -63,7 +62,6 @@ class GuideLink(QObject):
 
     def stop(self):
         self._stop.set()
-        self.stop_navigation()
 
     # ---------------- 시리얼 수신 루프 ----------------
     def _serial_loop(self):
@@ -99,8 +97,7 @@ class GuideLink(QObject):
             elif evt == EVT_EVENT:
                 self.event_occurred.emit()
             elif evt == SIGNAL_ARRIVED:
-                self.stop_navigation()
-                self.arrived.emit()
+                self.arrived.emit()  # 도착해도 GPS 전송은 멈추지 않는다
             elif evt == SIGNAL_TURN_LEFT:
                 self.turn_left.emit()
             elif evt == SIGNAL_TURN_RIGHT:
@@ -129,33 +126,28 @@ class GuideLink(QObject):
             print(f"[guide:fw] {text}")
 
     # ---------------- 목적지 확정 + GPS 위치 스트리밍 ----------------
-    def update_position(self, lat: float, lon: float):
-        """GPSLink에서 새 위치가 들어올 때마다 호출 - 다음 1초 tick에 이 값을 보낸다."""
-        self._last_lat = lat
-        self._last_lon = lon
+    def update_position(self, lat: float, lon: float, hdop=None):
+        """GPSLink에서 새 픽스가 올 때마다 호출 - 바로 보낸다."""
+        self._last = (lat, lon, hdop, time.monotonic())
+        self._write_gps(lat, lon, hdop)
+
+    def clear_position(self):
+        """GPS가 끊겼을 때 호출 - 저장한 좌표를 지운다(안내 시작 때 낡은 좌표를 사전 전송하지 않게)."""
+        self._last = None
 
     def start_navigation(self, dest_code: int):
-        """목적지 확정 바이트(CMD_DEST_BUS_STOP/CMD_DEST_SCHOOL)를 1회 보내고,
-        그 뒤로 GPS_UPDATE_INTERVAL_S 주기로 현재 위치 전송을 시작한다."""
-        threading.Thread(target=self._write_byte, args=(dest_code,), daemon=True).start()
-        self._arm_gps_timer()
+        """최신 GPS를 먼저 보내고 목적지 확정 바이트(CMD_DEST_BUS_STOP/CMD_DEST_SCHOOL)를 1회 보낸다.
+        보드는 목적지 바이트를 받는 즉시 그 순간 알고 있는 위치로 경로를 요청하므로, 위치가 먼저 가야 한다."""
+        threading.Thread(target=self._start_sequence, args=(dest_code,), daemon=True).start()
+
+    def _start_sequence(self, dest_code: int):
+        last = self._last
+        if last and time.monotonic() - last[3] <= GPS_MAX_AGE_S:
+            self._write_gps(last[0], last[1], last[2])  # 보드가 경로를 요청할 때 현재 위치를 알고 있게
+        self._write_byte(dest_code)
 
     def stop_navigation(self):
-        if self._gps_timer:
-            self._gps_timer.cancel()
-            self._gps_timer = None
-
-    def _arm_gps_timer(self):
-        if self._gps_timer:
-            self._gps_timer.cancel()
-        self._gps_timer = threading.Timer(GPS_UPDATE_INTERVAL_S, self._send_gps_tick)
-        self._gps_timer.daemon = True
-        self._gps_timer.start()
-
-    def _send_gps_tick(self):
-        if self._last_lat is not None and self._last_lon is not None:
-            self._write_gps(self._last_lat, self._last_lon)
-        self._arm_gps_timer()  # threading.Timer는 1회성이라 매 tick마다 다시 건다
+        """호환용으로 남겨둔 no-op. GPS 전송은 안내 여부와 상관없이 계속된다."""
 
     def _write_byte(self, value: int):
         with self._ser_lock:
@@ -167,12 +159,15 @@ class GuideLink(QObject):
             else:
                 print("[guide] 시리얼 연결 안 됨, 전송 스킵")
 
-    def _write_gps(self, lat: float, lon: float):
-        line = f"GPS,{lat:.6f},{lon:.6f}\n".encode("ascii")
+    def _write_gps(self, lat: float, lon: float, hdop=None):
+        text = f"GPS,{lat:.6f},{lon:.6f}" + (f",{hdop:.1f}" if hdop else "") + "\n"
+        self._write_line(text)
+
+    def _write_line(self, text: str):
         with self._ser_lock:
             if self._ser and self._ser.is_open:
                 try:
-                    self._ser.write(line)
+                    self._ser.write(text.encode("ascii"))
                 except Exception as e:
-                    print(f"[guide] GPS 전송 실패: {e}")
-            # 연결 안 된 상태는 매초 로그가 시끄러우니 조용히 스킵(재연결되면 다음 tick부터 다시 됨)
+                    print(f"[guide] 전송 실패: {e}")
+            # 연결 안 된 상태는 매 픽스마다 로그가 시끄러우니 조용히 스킵(재연결되면 다음 픽스부터 다시 됨)

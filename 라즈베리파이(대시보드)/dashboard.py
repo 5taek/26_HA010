@@ -18,8 +18,9 @@ from ircamera_link import (
     IrCameraLink,
     OBJECT_CODES,
 )
+from earphone_audio import EarphoneAudio
 from keyword_spotting_link import KeywordSpottingLink
-from tof_link import GRID_CELLS, GRID_COLS, GRID_ROWS, TofLink
+from tof_link import GRID_CELLS, GRID_COLS, GRID_ROWS, TOP_GRID_CELLS, TOP_GRID_COLS, TOP_GRID_ROWS, TofLink
 
 # 블루투스 이어폰 MAC 주소 목록. 페어링된 기기가 여러 개(승우의 Buds3 Pro / DST-S02)라
 # 그때그때 어느 쪽을 쓸지 바뀔 수 있어서, 배지는 "이 중 하나라도 연결돼 있으면 연결됨"으로
@@ -241,9 +242,17 @@ class ResultPanel(QFrame):
         self.conf_label = QLabel("신뢰도 —")
         self.conf_label.setStyleSheet(f"color: {TEXT_SUB}; font-size: 13px;")
 
+        # 정류장 체크(0xB4)에서 받은 도착 예정 노선 - 매칭(0xB1 matched)되면 ✓ 표시
+        self.candidates_label = QLabel("")
+        self.candidates_label.setWordWrap(True)
+        self.candidates_label.setStyleSheet(f"color: {TEXT_SUB}; font-size: 13px;")
+        self._candidates = []   # [(노선번호, 도착초 또는 None)]
+        self._matched_routes = set()
+
         layout.addWidget(title)
         layout.addWidget(self.value_label)
         layout.addWidget(self.conf_label)
+        layout.addWidget(self.candidates_label)
 
         self.setStyleSheet(f"""
             #ResultPanel {{
@@ -259,11 +268,33 @@ class ResultPanel(QFrame):
         self.value_label.setStyleSheet(f"color: {color}; font-size: 34px; font-weight: 800;")
         status = "확정" if matched else "인식중..."
         self.conf_label.setText(f"신뢰도 {confidence * 100:.0f}% · {status}")
+        if matched and text:
+            self._matched_routes.add(text)
+            self._render_candidates()
+
+    def show_candidates(self, candidates):
+        self._candidates = list(candidates)
+        self._matched_routes = set()
+        self._render_candidates()
+
+    def _render_candidates(self):
+        if not self._candidates:
+            self.candidates_label.setText("")
+            return
+        parts = []
+        for route, arr in self._candidates:
+            mark = "✓ " if route in self._matched_routes else ""
+            when = f" ({max(1, round(arr / 60))}분)" if arr is not None else ""
+            parts.append(f"{mark}{route}{when}")
+        self.candidates_label.setText("도착 예정: " + " · ".join(parts))
 
     def clear_result(self):
         self.value_label.setText("—")
         self.value_label.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 34px; font-weight: 800;")
         self.conf_label.setText("신뢰도 —")
+        self._candidates = []
+        self._matched_routes = set()
+        self.candidates_label.setText("")
 
 
 # ============================================================
@@ -342,12 +373,13 @@ class BrailleStatus(QFrame):
             }}
         """)
 
-    def update_status(self, present: bool, confidence: int, near: bool):
+    def update_status(self, present: bool, confidence: int, near: bool, direction_name: str = "-"):
         if not present:
             self.clear()
         else:
             distance = "근접" if near else "일반 거리"
-            self.value_label.setText(f"점자블록 감지됨 · {distance}")
+            where = f" · {direction_name}" if direction_name != "-" else ""
+            self.value_label.setText(f"점자블록 감지됨 · {distance}{where}")
             self.conf_label.setText(f"신뢰도 {confidence}%")
 
     def clear(self):
@@ -356,11 +388,12 @@ class BrailleStatus(QFrame):
 
 
 # ============================================================
-# TOF 8x8 원본 거리 그리드 (0xB2 패킷, 129바이트 고정 - tof_link.TofLink / RPI_COMM.md)
-# TOF0 모듈이 내부 손상으로 확정되어 교체 전까지 TOF1 하나만 8x8 단독 운용 중(2026-08-28~).
-# 인덱스는 row*GRID_COLS+col (row-major)로 위젯의 (row, col)에 그대로 대응된다:
-#   row 0=맨 윗줄  row 1-5=중간  row 6-7=맨 아랫줄 2줄
-#   col 0-1=LEFT(좌측)  col 2-5=CENTER(정면)  col 6-7=RIGHT(우측)
+# TOF 8x8 원본 거리 그리드 (0xB2 패킷, 129바이트 고정 - tof_link.TofLink)
+# 센서 2개 구성(2026-10-13~): 8x8은 TOF1(중·하단 담당, 0xB2), 그 위에 상단(머리) TOF0 4x4(0xB4,
+# 33바이트)를 같이 그린다.
+# 인덱스는 row*GRID_COLS+col (row-major)로 위젯의 (row, col)에 그대로 대응된다.
+# ESP32 햅틱 판정 기준(참고): MID=row0-2, BOTTOM=row2-3, row4-7은 바닥 반사라 판정 제외
+#   col 1=LEFT(좌측)  col 2-5=CENTER(정면)  col 6=RIGHT(우측)  (col 0, 7은 제외)
 # ============================================================
 TOF_NEAR_MM = 300  # 이보다 가까우면 위험(빨강), 그 밖의 유효 칸은 주의(주황)
 
@@ -383,21 +416,21 @@ class TofGridWidget(QFrame):
         title.setStyleSheet(f"color: {TEXT_SUB}; font-size: 11px; font-weight: 600;")
         layout.addWidget(title)
 
-        grid = QGridLayout()
-        grid.setSpacing(4)
-        self._cells = []
-        for row in range(GRID_ROWS):
-            grid.setRowStretch(row, 1)
-            for col in range(GRID_COLS):
-                cell = QLabel("")
-                cell.setAlignment(Qt.AlignCenter)
-                cell.setMinimumSize(26, 24)
-                cell.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-                cell.setStyleSheet(self._cell_style(PANEL_BORDER))
-                grid.addWidget(cell, row, col)
-                self._cells.append(cell)
-                if row == 0:
-                    grid.setColumnStretch(col, 1)
+        # 상단(머리) 4x4 - 0xB4. 8x8보다 칸 수가 절반이라 가운데 절반 폭에 맞춰 둔다.
+        layout.addWidget(self._section_label("상단 (TOF0 4x4)"))
+        top_grid, self._top_cells = self._make_grid(TOP_GRID_ROWS, TOP_GRID_COLS)
+        # 세로 공간이 빠듯해서(8x8 행이 눌리면 숫자가 겹침) 상단 칸은 높이를 고정해 작게 둔다
+        top_grid.setSpacing(3)
+        for cell in self._top_cells:
+            cell.setFixedHeight(18)
+        top_row = QHBoxLayout()
+        top_row.addStretch(1)
+        top_row.addLayout(top_grid, 2)
+        top_row.addStretch(1)
+        layout.addLayout(top_row)
+
+        layout.addWidget(self._section_label("중·하단 (TOF1 8x8)"))
+        grid, self._cells = self._make_grid(GRID_ROWS, GRID_COLS)
         layout.addLayout(grid, 1)
 
         self.setStyleSheet(f"""
@@ -408,14 +441,44 @@ class TofGridWidget(QFrame):
             }}
         """)
 
+    def _section_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setStyleSheet(f"color: {TEXT_SUB}; font-size: 10px;")
+        return label
+
+    def _make_grid(self, rows: int, cols: int):
+        grid = QGridLayout()
+        grid.setSpacing(4)
+        cells = []
+        for row in range(rows):
+            grid.setRowStretch(row, 1)
+            for col in range(cols):
+                cell = QLabel("")
+                cell.setAlignment(Qt.AlignCenter)
+                cell.setMinimumSize(26, 24)
+                cell.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                cell.setStyleSheet(self._cell_style(PANEL_BORDER))
+                grid.addWidget(cell, row, col)
+                cells.append(cell)
+                if row == 0:
+                    grid.setColumnStretch(col, 1)
+        return grid, cells
+
     def _cell_style(self, bg: str) -> str:
         return f"background-color: {bg}; border-radius: 6px; color: {TEXT_MAIN}; font-size: 11px; font-weight: 700;"
 
     def update_grid(self, distances):
         """TofLink.grid_received(distances) 그대로 연결. 길이 64 리스트(row-major,
         row*GRID_COLS+col), 무효 칸은 None (tof_link.py 참고)."""
-        for idx, dist in enumerate(distances):
-            cell = self._cells[idx]
+        self._paint_cells(self._cells, distances)
+
+    def update_top_grid(self, distances):
+        """TofLink.top_grid_received(distances) 그대로 연결. 길이 16 리스트(row-major,
+        row*TOP_GRID_COLS+col), 무효 칸은 None."""
+        self._paint_cells(self._top_cells, distances)
+
+    def _paint_cells(self, cells, distances):
+        for cell, dist in zip(cells, distances):
             if dist is not None:
                 color = RED if dist < TOF_NEAR_MM else "#e8a33d"
                 cell.setText(str(dist))
@@ -426,6 +489,7 @@ class TofGridWidget(QFrame):
 
     def clear(self):
         self.update_grid([None] * GRID_CELLS)
+        self.update_top_grid([None] * TOP_GRID_CELLS)
 
 
 # ============================================================
@@ -601,7 +665,7 @@ class KeywordStatus(QFrame):
         elif mode == MODE_GUIDE:
             self._set("✅  '길안내' 인식 → 길안내 모드로 전환", MODE_COLORS[MODE_GUIDE])
         elif mode == MODE_EMERGENCY:
-            self._set("🚨  '넷' 인식 → 도움 요청", RED)
+            self._set("🚨  '제로' 인식 → 도움 요청", RED)
         else:
             self._set("❓  인식 실패, 다시 시도해주세요", RED)
         self._result_timer.start(2500)
@@ -715,13 +779,14 @@ class EventBanner(QFrame):
     def obstacle(self, label: str, confidence: float):
         self.flash(f"⚠️  장애물 감지 — {label} ({confidence * 100:.0f}%)", "#e8a33d")
 
-    def braille(self, present: bool, confidence: int, near: bool):
+    def braille(self, present: bool, confidence: int, near: bool, direction_name: str = "-"):
+        where = f"{direction_name}, " if direction_name != "-" else ""
         if not present:
             self.flash("🟨  점자블록 인식 안 됨", TEXT_SUB)
         elif near:
-            self.flash(f"🟨  점자블록 인식됨 (근접, {confidence}%)", MODE_COLORS[MODE_BRAILLE])
+            self.flash(f"🟨  점자블록 인식됨 ({where}근접, {confidence}%)", MODE_COLORS[MODE_BRAILLE])
         else:
-            self.flash(f"🟨  점자블록 인식됨 ({confidence}%)", MODE_COLORS[MODE_BRAILLE])
+            self.flash(f"🟨  점자블록 인식됨 ({where}{confidence}%)", MODE_COLORS[MODE_BRAILLE])
 
     def crosswalk(self):
         self.flash("🚦  횡단보도 인식됨", "#5b8def")
@@ -789,7 +854,8 @@ class DashboardWindow(QMainWindow):
         # TOF 그리드(TofGridWidget) 추가 후 side 컬럼 실제 필요 높이가 커져서
         # 기존 620이면 그리드가 sizeHint보다 작게 눌려 렌더링된다(행이 뭉개져 보임).
         # 여기서 min height를 올려도 부족하면 show() 이후 resize(sizeHint())로 보정한다.
-        self.setMinimumSize(1000, 870)
+        # 상단 4x4(0xB4) 추가로 sizeHint 높이가 약 1003이 돼서 최소 높이도 1000으로 올림(화면 1080).
+        self.setMinimumSize(1000, 1000)
         self.setStyleSheet(f"background-color: {BG}; color: {TEXT_MAIN}; font-family: 'Pretendard', 'Malgun Gothic', sans-serif;")
 
         central = QWidget()
@@ -935,6 +1001,13 @@ class DashboardWindow(QMainWindow):
     def show_ocr_result(self, text: str, confidence: float, matched: bool = True):
         self.result_panel.show_result(text, confidence, matched)
 
+    def show_bus_candidates(self, candidates):
+        if candidates:
+            self.result_panel.show_candidates(candidates)
+        else:
+            # 버스모드 패널은 곧바로 장애물모드로 감춰지므로 배너로 알린다
+            self.event_banner.flash("🚌  도착 예정 버스 없음", TEXT_SUB)
+
     def show_obstacle_event(self, label: str, confidence: float):
         self.event_banner.obstacle(label, confidence)
 
@@ -965,9 +1038,9 @@ class DashboardWindow(QMainWindow):
             self._last_obstacle_key = key
             self.show_obstacle_event(f"{direction_name} {object_name}", confidence / 100)
 
-    def show_braille_result(self, present: bool, confidence: int, near: bool):
-        self.event_banner.braille(present, confidence, near)
-        self.braille_status.update_status(present, confidence, near)
+    def show_braille_result(self, present: bool, confidence: int, near: bool, direction_name: str):
+        self.event_banner.braille(present, confidence, near, direction_name)
+        self.braille_status.update_status(present, confidence, near, direction_name)
 
     def set_keyword_serial_connected(self, connected: bool):
         self.keyword_badge.set_connected(connected)
@@ -981,6 +1054,9 @@ class DashboardWindow(QMainWindow):
 
     def update_tof_grid(self, distances):
         self.tof_grid.update_grid(distances)
+
+    def update_tof_top_grid(self, distances):
+        self.tof_grid.update_top_grid(distances)
 
     def handle_tof_haptic_fired(self, height: int, direction: int, distance_mm: int):
         self._latest_tof_direction = direction
@@ -1038,8 +1114,14 @@ def main():
     app = QApplication(sys.argv)
     window = DashboardWindow()
 
+    # ---- 블루투스 이어폰 음성 안내 (ircamera 스피커와 같은 클립을 이어폰으로도, earphone_audio.py) ----
+    earphone = EarphoneAudio()
+
     # ---- ircamera (ACM1: 장애물/버스OCR/점자블록 + TCP:8090 영상) ----
     link = IrCameraLink()
+    # ESP32가 스피커로 클립을 낼 때(음성 명령 전송 성공 / 실제 모드 진입) 이어폰도 같이 낸다.
+    # 버스 후보 안내("937" "도착예정")/도착버스없음/매칭된 노선번호도 포함(2026-10-16, 0xB4).
+    link.voice_cue.connect(earphone.play)
     link.frame_received.connect(window.set_camera_frame)
     link.mode_changed.connect(window.set_mode)
     link.obstacle_detected.connect(window.handle_obstacle_packet)
@@ -1065,6 +1147,7 @@ def main():
 
     link.obstacle_detected.connect(on_obstacle_for_confirm)
     link.bus_result.connect(lambda text, conf, matched: window.show_ocr_result(text, conf / 100, matched))
+    link.bus_candidates.connect(window.show_bus_candidates)
     link.braille_result.connect(window.show_braille_result)
     link.serial_connected.connect(window.set_ircamera_serial_connected)
     link.video_client_connected.connect(window.set_ircamera_video_connected)
@@ -1085,7 +1168,6 @@ def main():
     # 만들어지지만, 이 함수는 실제 인식 시점(즉 main() 실행이 다 끝난 뒤)에나 호출되므로
     # 클로저로 참조해도 문제없다.
     def trigger_guide_mode():
-        guide_link.stop_navigation()  # 이전에 진행 중이던 목적지/GPS 스트리밍이 있었다면 리셋
         window.enter_guide_mode()
         link.send_guide_voice(GUIDE_VOICE_ENTER)  # "길안내모드전환" 재생(ircamera 스피커)
 
@@ -1099,6 +1181,8 @@ def main():
             trigger_guide_mode()
         elif mode == MODE_EMERGENCY:
             trigger_emergency_alert()
+        else:
+            link.send_retry_prompt()  # 인식 실패/timeout - ESP32 스피커 + voice_cue로 이어폰도 같이
 
     keyword_link.keyword_recognized.connect(on_keyword_recognized)
 
@@ -1124,10 +1208,11 @@ def main():
     keyword_link.guide_mode_check = lambda: window._guide_button_active
     keyword_link.guide_short_press.connect(lambda: on_guide_cycle())
 
-    # ---- TOF (/dev/tof: 8x8 원본 그리드 0xB2 + 햅틱 발화 이벤트 0xB3 - RPI_COMM.md) ----
+    # ---- TOF (/dev/tof: 중·하단 8x8 그리드 0xB2 + 상단 4x4 그리드 0xB4 + 햅틱 발화 이벤트 0xB3) ----
     tof_link = TofLink()
     tof_link.serial_connected.connect(window.set_tof_connected)
     tof_link.grid_received.connect(window.update_tof_grid)
+    tof_link.top_grid_received.connect(window.update_tof_top_grid)
     tof_link.haptic_fired.connect(window.handle_tof_haptic_fired)
 
     # ---- 길안내 보드 (/dev/guide: 짧게 누름=목적지 순환, 길게 누름(2초+)=목적지 확정+길안내 시작) ----
@@ -1191,11 +1276,19 @@ def main():
 
     def on_gps_fix(connected, lat, lon):
         if connected:
-            guide_link.update_position(lat, lon)
             link.set_gps_fix(lat, lon)
             keyword_link.set_gps_fix(lat, lon)
 
     gps_link.fix_changed.connect(on_gps_fix)
+
+    # 길안내 보드는 HDOP까지 담은 fix_detail로 받는다. 끊기면 저장한 좌표를 지우고 보내지 않는다.
+    def on_gps_detail(connected, lat, lon, hdop):
+        if connected:
+            guide_link.update_position(lat, lon, hdop or None)
+        else:
+            guide_link.clear_position()
+
+    gps_link.fix_detail.connect(on_gps_detail)
 
     link.start()
     keyword_link.start()

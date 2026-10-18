@@ -9,6 +9,7 @@ DEFAULT_SERIAL_BAUD = 921600  # USB CDC 네이티브 방식이라 사실상 무�
 
 PKT_RAW_GRID = 0xB2
 PKT_HAPTIC_FIRED = 0xB3
+PKT_TOP_GRID = 0xB4
 
 GRID_ROWS = 8
 GRID_COLS = 8
@@ -18,6 +19,13 @@ GRID_CELLS = GRID_ROWS * GRID_COLS  # 64
 RAW_GRID_PAYLOAD_FMT = f"<{GRID_CELLS}h"
 RAW_GRID_PAYLOAD_SIZE = struct.calcsize(RAW_GRID_PAYLOAD_FMT)  # 128
 
+TOP_GRID_ROWS = 4
+TOP_GRID_COLS = 4
+TOP_GRID_CELLS = TOP_GRID_ROWS * TOP_GRID_COLS  # 16
+
+TOP_GRID_PAYLOAD_FMT = f"<{TOP_GRID_CELLS}h"
+TOP_GRID_PAYLOAD_SIZE = struct.calcsize(TOP_GRID_PAYLOAD_FMT)  # 32
+
 HAPTIC_FIRED_PAYLOAD_FMT = "<BBh"  # height(1B) + direction(1B) + distance_mm(int16 LE)
 HAPTIC_FIRED_PAYLOAD_SIZE = struct.calcsize(HAPTIC_FIRED_PAYLOAD_FMT)  # 4
 
@@ -25,6 +33,8 @@ HAPTIC_FIRED_PAYLOAD_SIZE = struct.calcsize(HAPTIC_FIRED_PAYLOAD_FMT)  # 4
 class TofLink(QObject):
     # distances: 길이 64 리스트(row-major, row*GRID_COLS+col), 무효 칸은 None
     grid_received = Signal(list)
+    # 상단 4x4: 길이 16 리스트(row-major, row*TOP_GRID_COLS+col), 무효 칸은 None
+    top_grid_received = Signal(list)
     # height(0~2), direction(0~2), distance_mm
     haptic_fired = Signal(int, int, int)
     serial_connected = Signal(bool)
@@ -62,6 +72,8 @@ class TofLink(QObject):
             try:
                 if msg_type == PKT_RAW_GRID:
                     self._handle_raw_grid(ser)
+                elif msg_type == PKT_TOP_GRID:
+                    self._handle_top_grid(ser)
                 elif msg_type == PKT_HAPTIC_FIRED:
                     self._handle_haptic_fired(ser)
                 else:
@@ -76,6 +88,12 @@ class TofLink(QObject):
         flat = struct.unpack(RAW_GRID_PAYLOAD_FMT, payload)
         distances = [v if v >= 0 else None for v in flat]
         self.grid_received.emit(distances)
+
+    def _handle_top_grid(self, ser):
+        payload = self._read_exact(ser, TOP_GRID_PAYLOAD_SIZE)
+        flat = struct.unpack(TOP_GRID_PAYLOAD_FMT, payload)
+        distances = [v if v >= 0 else None for v in flat]
+        self.top_grid_received.emit(distances)
 
     def _handle_haptic_fired(self, ser):
         payload = self._read_exact(ser, HAPTIC_FIRED_PAYLOAD_SIZE)
