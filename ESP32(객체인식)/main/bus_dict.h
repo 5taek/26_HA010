@@ -1,3 +1,4 @@
+// 자동 생성됨: train_rec.py (esp32ocr 프로젝트에서 복사, 원본 수정 금지)
 // 버스 노선번호 전용 글자 사전 (CTC blank 포함)
 #pragma once
 

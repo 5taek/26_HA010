@@ -24,7 +24,6 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
-#include "mp3dec.h"
 #include "esp_partition.h"
 #include "esp_timer.h"
 #include "img_converters.h"
@@ -97,29 +96,30 @@ static const void               *s_bb_model = nullptr;
 #define SPK_DIN_GPIO     GPIO_NUM_42
 #define SPK_GAIN_GPIO    GPIO_NUM_41   // LOW = 15dB(최대), HIGH = 6dB
 #define SPK_MODE_GPIO    GPIO_NUM_40   // LOW = shutdown, HIGH = 좌채널 재생
-#define SPK_SAMPLE_RATE  24000   // 구글 TTS MP3 출력이 24kHz
+#define SPK_SAMPLE_RATE  24000   // 음성 클립(wav) 샘플레이트
 
 static i2s_chan_handle_t s_spk = NULL;
 static i2s_std_config_t  s_spk_cfg;
-static SemaphoreHandle_t s_spk_lock = NULL;   // TTS/음성클립 중복 재생 방지
+static SemaphoreHandle_t s_spk_lock = NULL;   // 음성클립/비프 중복 재생 방지
 
-// 2026-08-24: 음성 재생을 별도 태스크(audio_task, core0)로 분리하는 큐.
-// cane_mode_task(core1)는 이 큐에 키만 넣고 바로 리턴 — 재생 자체(블로킹, 1.5~2초)를
-// 기다리지 않는다. 그동안 추론이 계속 돌 수 있게 하는 게 목적 (8.24개발기록 참고).
-// 2026-08-26: "버스정류장으로길안내를시작합니다"가 UTF-8로 48바이트라 기존
-// 32바이트로는 큐에서 잘려서(중간에 끊긴 멀티바이트) play_voice_clip()의
-// strcmp 매칭이 실패했다 — 64로 늘려 여유 확보.
+
 #define AUDIO_QUEUE_KEY_LEN 64
 static QueueHandle_t s_audio_queue = NULL;
 
-// 2026-08-30: CMD_FALL_ALERT_START(0x0A)~STOP(0x0B) 사이에 "낙상감지"를
+// TOF 장애물 비프 요청 (RPi가 0x0D로 보냄). 길이 1짜리 큐 + xQueueOverwrite라서
+// 항상 "가장 최근 요청"만 남는다 — 음성 클립이 재생되는 동안 쌓여서 늦게 울리는
+// 낡은 경고음을 막기 위함. audio_task가 꺼낼 때 300ms 넘은 요청은 버린다.
+struct TofBeepReq { uint8_t height; uint8_t dir; int64_t t_us; };
+static QueueHandle_t s_beep_queue = NULL;
+
+// CMD_FALL_ALERT_START(0x0A)~STOP(0x0B) 사이에 "낙상감지"를
 // 무한 반복 재생하기 위한 플래그. audio_task가 큐가 비어 있을 때마다 이 값을
 // 확인해서 켜져 있으면 계속 재큐잉한다 — 일반 큐 항목(장애물/모드전환 등)이
 // 새로 들어오면 그쪽을 먼저 처리하고, 그 사이사이(최대 50ms 지연)에 반복분을
 // 끼워넣는 식이라 다른 안내가 낙상반복 때문에 굶주리지 않는다.
 static volatile bool s_fall_alert_active = false;
 
-// 2026-08-18: 버스번호/모드전환 안내용 음성 클립 — flash mmap(RAM 0),
+// 버스번호/모드전환 안내용 음성 클립 — flash mmap(RAM 0),
 // voice_clips.h의 오프셋 테이블로 이 안에서 잘라 씀. cane_mode_task 부팅 시
 // map_partition("voice", ...)으로 채워짐.
 static const void *s_voice_data = nullptr;
@@ -180,7 +180,6 @@ static void ir_gpio_init(void)
 }
 
 static void spk_beep(int freq_hz, int ms, float vol);   // 전방 선언
-static bool tts_speak(const char *text);
 static volatile bool s_wifi_ready = false;
 
 static void ir_set(bool on)
@@ -189,7 +188,7 @@ static void ir_set(bool on)
     s_ir_on = on;
     gpio_set_level(IR_LED_GPIO, on ? 1 : 0);
     ESP_LOGI(TAG, "IR LED %s", on ? "ON" : "OFF");
-    // 2026-08-18: "적외선 켜짐/꺼짐" 음성 안내 + 대체 비프음 제거 (요청).
+    // "적외선 켜짐/꺼짐" 음성 안내 + 대체 비프음 제거 (요청).
     // LED 자체는 그대로 켜지고/꺼짐, 안내음만 없앰.
 }
 
@@ -269,6 +268,48 @@ static void spk_beep(int freq_hz, int ms, float vol)
     }
 }
 
+// 비프 사이 무음 구간. i2s에 0을 흘려 보내서 앞 소리가 반복되지 않게 한다.
+static void spk_silence(int ms)
+{
+    if (!s_spk) return;
+    const int n_total = SPK_SAMPLE_RATE * ms / 1000;
+    const int chunk   = 256;
+    int16_t   buf[chunk] = {0};
+    size_t    written;
+    for (int i = 0; i < n_total; i += chunk) {
+        int n = (n_total - i < chunk) ? (n_total - i) : chunk;
+        i2s_channel_write(s_spk, buf, n * sizeof(int16_t), &written, 200);
+    }
+}
+
+// TOF 장애물 비프 (RPi tof_beep.py와 같은 규칙).
+//   방향: 0=LEFT 500Hz, 1=CENTER 1000Hz, 2=RIGHT 2000Hz (진폭 0.6)
+//   높이: 0=TOP    100ms ON/80ms OFF x3
+//         1=MID    150ms ON/100ms OFF/150ms ON
+//         2=BOTTOM 200ms ON
+// audio_task 안에서만 호출한다 (재생이 최대 ~0.5초 블로킹되므로 추론 태스크에서 부르면 안 됨).
+static void play_tof_beep(uint8_t height, uint8_t dir)
+{
+    static const int   kFreq[3] = { 500, 1000, 2000 };
+    static const float kVol     = 0.6f;
+    if (!s_spk || !s_spk_lock || height > 2 || dir > 2) return;
+    if (xSemaphoreTake(s_spk_lock, pdMS_TO_TICKS(100)) != pdTRUE) return;
+
+    spk_set_rate(SPK_SAMPLE_RATE);
+    const int f = kFreq[dir];
+    if (height == 0) {
+        for (int i = 0; i < 3; i++) { spk_beep(f, 100, kVol); spk_silence(80); }
+    } else if (height == 1) {
+        spk_beep(f, 150, kVol); spk_silence(100); spk_beep(f, 150, kVol);
+    } else {
+        spk_beep(f, 200, kVol);
+    }
+    // auto_clear가 꺼져 있어 쓰기가 끊기면 DMA가 마지막 버퍼를 반복 재생한다("삐~~" 지속음).
+    // 무음으로 DMA 버퍼를 덮어서 끊는다.
+    spk_silence(100);
+    xSemaphoreGive(s_spk_lock);
+}
+
 // ── 로컬 음성 클립 재생 (버스번호/모드전환 안내) ───────────────────────────────
 // voice_clips.h 테이블에서 key를 찾아 flash mmap된 voice 파티션에서 그 구간만
 // 그대로 I2S로 흘려보낸다. MP3 디코딩도, PSRAM 복사도 없음 — 전부 24kHz/16bit
@@ -301,7 +342,7 @@ static bool play_voice_clip(const char *key)
     return true;
 }
 
-// 2026-08-24: cane_mode_task(core1)가 이걸 부르면 큐에 키만 넣고 바로 리턴한다.
+// cane_mode_task(core1)가 이걸 부르면 큐에 키만 넣고 바로 리턴한다.
 // 실제 재생(블로킹)은 audio_task(core0)가 큐를 비우면서 한다 — cane_mode_task는
 // 그동안 멈추지 않고 추론을 계속 돌 수 있다. 큐가 꽉 찬 경우(재생이 밀리는 중에
 // 새 요청이 또 들어온 경우)는 대기하지 않고 그냥 버린다 — 음성 안내가 밀려서
@@ -315,10 +356,25 @@ static void queue_voice_clip(const char *key) {
     }
 }
 
+// RPi의 0x0D 명령 → 비프 요청 등록. 최신 1건만 유지(xQueueOverwrite).
+static void queue_tof_beep(uint8_t height, uint8_t dir) {
+    if (!s_beep_queue) return;
+    TofBeepReq req = { height, dir, esp_timer_get_time() };
+    xQueueOverwrite(s_beep_queue, &req);
+}
+
 static void audio_task(void *arg) {
     char buf[AUDIO_QUEUE_KEY_LEN];
     while (true) {
-        // 2026-08-30: portMAX_DELAY로 대기 중이면 s_fall_alert_active가 나중에
+        // TOF 비프는 음성보다 먼저 처리한다. 음성 클립 재생(블로킹) 중에 들어온
+        // 요청은 여기서 300ms 넘게 묵었으면 이미 낡은 경고라 버린다.
+        TofBeepReq beep;
+        if (s_beep_queue && xQueueReceive(s_beep_queue, &beep, 0) == pdTRUE) {
+            if (esp_timer_get_time() - beep.t_us <= 300 * 1000) {
+                play_tof_beep(beep.height, beep.dir);
+            }
+        }
+        // portMAX_DELAY로 대기 중이면 s_fall_alert_active가 나중에
         // true로 바뀌어도 그 블로킹 콜이 안 깨어나서(FreeRTOS 큐 대기는 타임아웃을
         // 재평가 안 함) 0x0A 받고도 이미 대기 중이던 호출이 안 풀리면 재생이
         // 무기한 늦어지는 버그가 있었다 — 실기기 로그로 확인됨(0x0A 로그는 찍히는데
@@ -331,133 +387,6 @@ static void audio_task(void *arg) {
             play_voice_clip("낙상감지");
         }
     }
-}
-
-// ── TTS (구글 번역 TTS → MP3 → I2S) ─────────────────────────────────────────
-#define TTS_UA  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
-                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-
-static void url_encode(const char *src, char *dst, size_t dst_sz)
-{
-    static const char hex[] = "0123456789ABCDEF";
-    size_t j = 0;
-    for (size_t i = 0; src[i] && j + 4 < dst_sz; i++) {
-        unsigned char c = (unsigned char)src[i];
-        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-            dst[j++] = c;
-        } else {
-            dst[j++] = '%';
-            dst[j++] = hex[c >> 4];
-            dst[j++] = hex[c & 0xF];
-        }
-    }
-    dst[j] = '\0';
-}
-
-static bool tts_speak(const char *text)
-{
-    if (!s_spk || !s_spk_lock) return false;
-    if (xSemaphoreTake(s_spk_lock, pdMS_TO_TICKS(3000)) != pdTRUE) return false;
-
-    bool ok = false;
-
-    char enc[512];
-    url_encode(text, enc, sizeof(enc));
-
-    char url[768];
-    snprintf(url, sizeof(url),
-             "https://translate.google.com/translate_tts"
-             "?ie=UTF-8&client=tw-ob&tl=ko&q=%s", enc);
-
-    // 버퍼는 PSRAM에 잡는다 (내부 RAM 아끼기)
-    const size_t IN_SZ  = 8192;
-    uint8_t *in   = (uint8_t *)heap_caps_malloc(IN_SZ, MALLOC_CAP_SPIRAM);
-    int16_t *pcm  = (int16_t *)heap_caps_malloc(1152 * 2 * sizeof(int16_t),
-                                                MALLOC_CAP_SPIRAM);
-    HMP3Decoder dec = MP3InitDecoder();
-    esp_http_client_handle_t cli = NULL;
-
-    if (!in || !pcm || !dec) { ESP_LOGE(TAG, "TTS 메모리 부족"); goto done; }
-
-    {
-        esp_http_client_config_t cfg = {};
-        cfg.url             = url;
-        cfg.crt_bundle_attach = esp_crt_bundle_attach;
-        cfg.timeout_ms      = 8000;
-        cfg.buffer_size     = 2048;
-        cli = esp_http_client_init(&cfg);
-        if (!cli) goto done;
-        esp_http_client_set_header(cli, "User-Agent", TTS_UA);
-        esp_http_client_set_header(cli, "Referer", "https://translate.google.com/");
-
-        if (esp_http_client_open(cli, 0) != ESP_OK) {
-            ESP_LOGE(TAG, "TTS 연결 실패");
-            goto done;
-        }
-        esp_http_client_fetch_headers(cli);
-        int status = esp_http_client_get_status_code(cli);
-        if (status != 200) {
-            ESP_LOGE(TAG, "TTS HTTP %d", status);
-            goto done;
-        }
-    }
-
-    {
-        int  fill = 0;
-        bool eof  = false;
-        while (true) {
-            if (!eof && fill < (int)IN_SZ) {
-                int r = esp_http_client_read(cli, (char *)in + fill, IN_SZ - fill);
-                if (r > 0)      fill += r;
-                else if (r == 0) eof = true;
-                else             break;
-            }
-            if (fill == 0 && eof) { ok = true; break; }
-
-            uint8_t *p    = in;
-            int      left = fill;
-            int      off  = MP3FindSyncWord(p, left);
-            if (off < 0) {                       // 동기 못 찾음 → 버퍼 비우고 계속
-                fill = 0;
-                if (eof) { ok = true; break; }
-                continue;
-            }
-            p    += off;
-            left -= off;
-
-            int err = MP3Decode(dec, &p, &left, pcm, 0);
-            if (err) {
-                if (err == ERR_MP3_INDATA_UNDERFLOW && !eof) {
-                    memmove(in, p, left);        // 데이터 더 받아서 재시도
-                    fill = left;
-                    continue;
-                }
-                fill = 0;
-                if (eof) { ok = true; break; }
-                continue;
-            }
-
-            MP3FrameInfo fi;
-            MP3GetLastFrameInfo(dec, &fi);
-            spk_set_rate(fi.samprate);
-
-            size_t written;
-            i2s_channel_write(s_spk, pcm, fi.outputSamps * sizeof(int16_t),
-                              &written, 1000);
-
-            memmove(in, p, left);
-            fill = left;
-        }
-    }
-
-done:
-    if (cli) { esp_http_client_close(cli); esp_http_client_cleanup(cli); }
-    if (dec) MP3FreeDecoder(dec);
-    free(in);
-    free(pcm);
-    xSemaphoreGive(s_spk_lock);
-    if (!ok) ESP_LOGW(TAG, "TTS 실패: %s", text);
-    return ok;
 }
 
 // ── LTR-308 조도센서 (카메라가 만든 I2C 버스에 얹는다) ───────────────────────
@@ -681,7 +610,7 @@ static void resize_gray(const uint8_t *src, int sw, int sh, float *dst, int dn)
 
 // buf/w/h는 카메라 프레임의 복사본 — 호출부가 esp_camera_fb_return()을 먼저
 // 끝내고 나서 넘겨야 한다 (fb를 추론 내내 붙잡고 있으면 다른 태스크의 프레임
-// 획득이 밀림, 2026-08-14 개발기록 참고).
+// 획득이 밀림
 //
 // 모델(brailledet_v1_pure_int8.tflite)은 완전 int8 양자화된 14x14 그리드
 // YOLO 스타일 단일클래스 검출기다 (2026-08-15 학습 코드/실측으로 확정):
@@ -800,7 +729,7 @@ static void bb_task(void *arg)
 }
 
 // ── 버스정류장 게이팅 (GPS 근접 확인 + 실시간 도착정보) ────────────────────────
-// 2026-08-23: 버스모드 진입 전에, 사용자 위치에서 "가장 가까운 정류장"을
+// 버스모드 진입 전에, 사용자 위치에서 "가장 가까운 정류장"을
 // 무조건 찾고(거리 임계값 없음 — 멀든 가깝든 그냥 최근접 하나) 거기에 1분
 // 이내 도착하는 버스가 있는지만 확인한다. 없으면 버스모드(카메라 OCR)로
 // 안 들어가고 장애물모드 유지. RPi 쪽 옛날 코드(smartcane 통합본,
@@ -820,15 +749,12 @@ struct StationEntry {
     float    lon;
 } __attribute__((packed));
 
-// stations.bin 생성 시점 실측 개수. 파티션 크기(128K)가 아니라 이 값 기준으로
-// 순회한다 — map_partition()이 돌려주는 size는 파티션 크기(패딩 포함)라
-// 실제 레코드 수와 다르다(2026-08-17에 이 착각으로 PSRAM 예산을 잘못 계산한
-// 적 있음, 개발기록 참고). stations.bin을 재생성하면 이 숫자도 같이 갱신할 것.
+// stations.bin 생성 시점 실측 개수.
 static const int STATION_COUNT = 5913;
 
 static const void *s_stations_data = nullptr;
 
-// 2026-08-23: "정류장이 근처에 있냐" 판단은 안 함 — 무조건 최근접 정류장을
+// "정류장이 근처에 있냐" 판단은 안 함 — 무조건 최근접 정류장을
 // 쓰고 그 정류장의 도착정보만 본다. 그래서 거리 임계값 상수는 없음.
 // "곧 도착"으로 볼 기준(초). TAGO API의 arrTime 단위가 초라고 가정.
 static constexpr int BUS_ARRIVE_WITHIN_SEC = 300;
@@ -871,7 +797,7 @@ static bool find_nearest_station(float my_lat, float my_lon,
     return true;
 }
 
-// 2026-08-28: 정류장 게이팅에서 API가 실제로 찾아준 노선번호를 이번 세션의
+// 정류장 게이팅에서 API가 실제로 찾아준 노선번호를 이번 세션의
 // 동적 후보군으로 쓴다(고정 리스트 대신). 도착시각이 서로
 // BUS_CLUSTER_WINDOW_SEC 이내로 가까운 것들만 묶어서 후보로 삼고("연달아
 // 오는 무리"), 그보다 멀리 떨어진 건 이번엔 후보에서 뺀다 — 예를 들어
@@ -892,11 +818,6 @@ static constexpr int BUS_CLUSTER_WINDOW_SEC = 30;
 // TAGO 실시간 도착정보 조회 — BUS_ARRIVE_WITHIN_SEC 이내 도착하는 노선들을
 // (routeNo + 그 노선의 최소 arrTime으로) 전부 모은 뒤, 가장 빨리 오는 것
 // 기준 BUS_CLUSTER_WINDOW_SEC 이내인 것들만 s_bus_api_candidates[]에 채운다.
-// 리턴값은 그렇게 채워진 후보 개수(0=없음). 2026-08-26엔 "노선 개수"만
-// 셌었는데, 2026-08-28에 노선번호 자체 + 클러스터링까지 하도록 구조 변경.
-// RPi 옛날 코드(get_arriving_buses())와 동일한 엔드포인트/파라미터/응답구조.
-// 응답 버퍼는 PSRAM(일시적 사용, 호출 끝나면 바로 free — arena/가중치처럼
-// 상주시키는 게 아니라서 오늘 겪은 PSRAM 예산 문제와는 무관함).
 static int gather_bus_candidates(uint64_t bs_id) {
     s_bus_api_candidate_count = 0;
 
@@ -1041,7 +962,7 @@ static const int BUS_CANDIDATES_COUNT = 5;
 static char       s_bus_last_match[32] = {0};
 static SemaphoreHandle_t s_bus_result_lock = NULL;
 
-// 2026-08-26: 정류장 게이팅에서 gather_bus_candidates()(2026-08-28에
+// 정류장 게이팅에서 gather_bus_candidates()(2026-08-28에
 // count_buses_arriving_soon()에서 개명/확장)가 몇 대를 찾았는지 기억해두고,
 // 버스모드에서 하나 매칭될 때마다 비교한다. 매칭 수가 목표 수보다 적으면
 // 장애물모드로 안 돌아가고 버스모드를 새로 재진입(30초 타이머 리셋)해서
@@ -1196,7 +1117,7 @@ static int lcs_length(const char *a, const char *b) {
     return dp[la][lb];
 }
 
-// 2026-08-28: 완전일치 대신 "과반수 문자 일치"로 완화 — OCR이 몇 글자
+// 완전일치 대신 "과반수 문자 일치"로 완화 — OCR이 몇 글자
 // 잘못 읽어도(예: 937→837, 410-1→410) 후보 문자열의 절반을 넘게 맞으면
 // 매칭으로 인정하고, 재생은 OCR 원문이 아니라 후보의 정식 문자열로 한다.
 // s_bus_use_api_candidates가 true면 API가 준 동적 후보(이미 매칭된 건 제외)만
@@ -1441,7 +1362,6 @@ static bool bus_ocr_try_once(const void *det_model, const void *rec_model) {
                 ESP_LOGI(TAG, "🚌 [버스OCR 매칭] %s (원문: %s)", matched, rec_text);
                 snprintf(s_bus_last_match, sizeof(s_bus_last_match), "%s", matched);
                 // API 동적 후보였으면 이번 무리 안에서 소모 처리 — 재진입 시
-                // 같은 노선을 다시 매칭하지 않게 (2026-08-28).
                 if (s_bus_use_api_candidates) {
                     for (int i = 0; i < s_bus_api_candidate_count; i++) {
                         if (strcmp(s_bus_api_candidates[i].route_no, matched) == 0) {
@@ -1767,7 +1687,7 @@ static bool obs_run_once(const uint8_t *orig_img) {
 
 #define MODE_CMD_BUS     0x01
 #define MODE_CMD_BRAILLE 0x02
-// 2026-08-25: RPi가 ToF 활성방향과 AI(0xB0) 방향이 일치할 때만 보내는 트리거.
+// RPi가 ToF 활성방향과 AI(0xB0) 방향이 일치할 때만 보내는 트리거.
 // [0x10][object_code 1B] 총 2바이트 — object_code는 0xB0에서 쓰는 값 그대로
 // 재사용(0x01자전거 0x02킥보드 0x03볼라드 0x04사람). 모드 상관없이 받는 즉시
 // 해당 객체 음성 클립을 큐잉해서 스피커로 알려준다 (장애물종류안내음성.md 참고).
@@ -1803,11 +1723,17 @@ static bool obs_run_once(const uint8_t *orig_img) {
 //              이 두 명령이랑 무관한 단발성 재생.
 #define CMD_FALL_ALERT_START    0x0A
 #define CMD_FALL_ALERT_STOP     0x0B
+// 키워드 인식 실패/시간초과 시 RPi가 보내는 "다시말씀해주세요" 재생 요청 (페이로드 없음)
+#define CMD_RETRY_PROMPT        0x0C
+#define CMD_TOF_BEEP            0x0D   // + [height 0=TOP 1=MID 2=BOTTOM][dir 0=L 1=C 2=R]
 
 #define RESULT_MSG_OBSTACLE 0xB0
 #define RESULT_MSG_BUS       0xB1
 #define RESULT_MSG_BRAILLE    0xB2
-// 2026-08-26: ESP32가 RPi 명령 없이 스스로 장애물모드로 "복귀"하는 경우
+// 정류장 체크 결과(버스모드 진입 직전 1회): [0xB4][count] + count x ([len][노선번호 UTF-8][도착초 uint16 LE])
+// count=0이면 도착 예정 버스 없음(버스모드에 안 들어감).
+#define RESULT_MSG_BUS_CAND   0xB4
+// ESP32가 RPi 명령 없이 스스로 장애물모드로 "복귀"하는 경우
 // (버스매칭성공/버스타임아웃/점자블록근접확정/점자블록타임아웃, 전부
 // enter_mode(OBSTACLE)로 귀결됨) RPi가 이걸 사전에 알 방법이 없어서 추가.
 // 버스/점자블록 진입은 RPi가 직접 명령한 거라 이미 알고 있으므로 안 보냄 —
@@ -1883,7 +1809,7 @@ static bool usb_cdc_poll_cmd(uint8_t *out_cmd) {
     return false;
 }
 
-// 2026-08-23: MODE_CMD_BUS 뒤에 위도/경도(float32 LE 각 4B, 총 8B)가 붙어서
+// MODE_CMD_BUS 뒤에 위도/경도(float32 LE 각 4B, 총 8B)가 붙어서
 // 옴 — RPi가 한 번의 write()로 [0x01][lat 4B][lon 4B]를 같이 보내는 걸
 // 전제로, 커맨드 바이트 받은 직후 짧게 블로킹해서 나머지 8바이트를 마저
 // 읽는다. RPi 전송과 시간차가 크면(수백 ms 이상) 실패할 수 있음 — 그런
@@ -1905,7 +1831,7 @@ static bool usb_cdc_read_gps_payload(float *out_lat, float *out_lon) {
     return true;
 }
 
-// 2026-08-25: CMD_OBSTACLE_CONFIRM 뒤에 붙는 object_code 1바이트를 읽는다.
+// CMD_OBSTACLE_CONFIRM 뒤에 붙는 object_code 1바이트를 읽는다.
 // usb_cdc_read_gps_payload()와 동일한 짧은 블로킹 패턴 (최대 300ms).
 static bool usb_cdc_read_obstacle_payload(uint8_t *out_code) {
     int64_t deadline = esp_timer_get_time() + 300 * 1000;
@@ -1930,7 +1856,7 @@ static const char *obstacle_voice_key(uint8_t object_code) {
     }
 }
 
-// 2026-08-26: CMD_DESTINATION 뒤에 붙는 페이로드 1바이트를 읽는다.
+// CMD_DESTINATION 뒤에 붙는 페이로드 1바이트를 읽는다.
 // usb_cdc_read_obstacle_payload()와 동일한 짧은 블로킹 패턴 (최대 300ms).
 static bool usb_cdc_read_destination_payload(uint8_t *out_code) {
     int64_t deadline = esp_timer_get_time() + 300 * 1000;
@@ -1940,6 +1866,21 @@ static bool usb_cdc_read_destination_payload(uint8_t *out_code) {
     }
     ESP_LOGW(TAG, "길안내 트리거 페이로드 수신 실패");
     return false;
+}
+
+// CMD_TOF_BEEP(0x0D) 뒤에 붙는 페이로드 2바이트 [height][direction]를 읽는다 (최대 300ms).
+static bool usb_cdc_read_tof_beep_payload(uint8_t out[2]) {
+    int got = 0;
+    int64_t deadline = esp_timer_get_time() + 300 * 1000;
+    while (got < 2 && esp_timer_get_time() < deadline) {
+        int n = usb_serial_jtag_read_bytes(out + got, 2 - got, pdMS_TO_TICKS(50));
+        if (n > 0) got += n;
+    }
+    if (got < 2) {
+        ESP_LOGW(TAG, "TOF 비프 페이로드 수신 실패");
+        return false;
+    }
+    return true;
 }
 
 // CMD_DESTINATION payload -> voice_clips.h 키 매핑.
@@ -1976,9 +1917,38 @@ static void send_bus_result(const char *text, float conf, bool matched) {
     usb_cdc_write(pkt, 2 + len + 2);
 }
 
-static void send_braille_result(bool present, float conf, bool near) {
-    uint8_t pkt[4] = { RESULT_MSG_BRAILLE, (uint8_t)(present ? 1 : 0),
-                        (uint8_t)(conf * 100.0f), (uint8_t)(near ? 1 : 0) };
+// 버스 후보 패킷 전송. s_bus_api_candidates[0..count)를 그대로 싣는다.
+// 최대 길이 = 2 + 8 x (1 + 15 + 2) = 146바이트. 한 번의 write로 보내 중간에 안 끊기게 한다.
+static void send_bus_candidates(int count) {
+    uint8_t pkt[2 + kBusApiCandidateMax * (1 + 15 + 2)];
+    if (count < 0) count = 0;
+    if (count > kBusApiCandidateMax) count = kBusApiCandidateMax;
+    size_t n = 0;
+    pkt[n++] = RESULT_MSG_BUS_CAND;
+    pkt[n++] = (uint8_t)count;
+    for (int i = 0; i < count; i++) {
+        const BusApiCandidate &c = s_bus_api_candidates[i];
+        uint8_t len = (uint8_t)strnlen(c.route_no, 15);
+        int sec = c.arr_time_sec < 0 ? 0 : (c.arr_time_sec > 65535 ? 65535 : c.arr_time_sec);
+        pkt[n++] = len;
+        memcpy(pkt + n, c.route_no, len);
+        n += len;
+        pkt[n++] = (uint8_t)(sec & 0xFF);
+        pkt[n++] = (uint8_t)((sec >> 8) & 0xFF);
+    }
+    usb_cdc_write(pkt, n);
+}
+
+// 패킷: [0xB2][있음][conf%][근접][dir] 5바이트. dir: 0=없음/미상 1=왼쪽 2=중앙 3=오른쪽
+static void send_braille_result(bool present, float conf, bool near, const char *dir) {
+    uint8_t dir_code = 0;
+    if (dir) {
+        if (strcmp(dir, "left") == 0)        dir_code = 1;
+        else if (strcmp(dir, "center") == 0) dir_code = 2;
+        else if (strcmp(dir, "right") == 0)  dir_code = 3;
+    }
+    uint8_t pkt[5] = { RESULT_MSG_BRAILLE, (uint8_t)(present ? 1 : 0),
+                        (uint8_t)(conf * 100.0f), (uint8_t)(near ? 1 : 0), dir_code };
     usb_cdc_write(pkt, sizeof(pkt));
 }
 
@@ -1993,7 +1963,7 @@ static void enter_mode(CaneMode m) {
     // 진행되지만, 최소한 다음에 멈춤이 재현됐을 때 시리얼 로그로 원인을 짚을 수
     // 있게 한다 (2026-08-14 개발기록 참고).
     if (m == CaneMode::OBSTACLE) {
-        // 2026-08-26: 점자블록(s_bb)과 동일한 이유로 리셋 — 장애물모드 재진입
+        // 점자블록(s_bb)과 동일한 이유로 리셋 — 장애물모드 재진입
         // 직후 obs_run_once()가 이번 사이클에 실패(모델 로드 실패/Invoke 실패)
         // 해도 send_obstacle_result()는 무조건 호출되므로, 리셋 안 하면 몇 분
         // 전(모드 전환 전) 묵은 값이 새 감지인 것처럼 RPi로 나갈 수 있었다.
@@ -2052,7 +2022,7 @@ static void enter_mode(CaneMode m) {
     // 시간(~1.5~2초)만큼 붙잡는다. 매 프레임마다가 아니라 모드 전환 시
     // 1회뿐이라 지금은 수용 가능한 수준으로 판단, 나중에 부담되면 별도
     // 오디오 태스크+큐로 분리할 것).
-    // 2026-08-24: 큐잉으로 변경 — 재생(1.5~2초) 끝날 때까지 cane_mode_task를
+    // 큐잉으로 변경 — 재생(1.5~2초) 끝날 때까지 cane_mode_task를
     // 붙잡지 않는다 (audio_task가 core0에서 실제 재생 담당, 위 queue_voice_clip 참고).
     if (m == CaneMode::OBSTACLE) queue_voice_clip("장애물모드전환");
     else if (m == CaneMode::BUS) queue_voice_clip("버스탐지모드전환");
@@ -2122,12 +2092,24 @@ static void cane_mode_task(void *arg) {
                         if (soon_count <= 0) {
                             ESP_LOGI(TAG, "[정류장체크] 최근접 정류장(%.0fm, bsId=%llu) 도착예정 버스 없음",
                                      dist_m, (unsigned long long)bs_id);
+                            send_bus_candidates(0);   // RPi 대시보드에 "도착 예정 버스 없음" 통지
                             queue_voice_clip("도착버스없음");
                         } else {
                             ESP_LOGI(TAG, "[정류장체크] 통과 (%.0fm, bsId=%llu) — %d대(무리) 도착예정, 버스모드 진입",
                                      dist_m, (unsigned long long)bs_id, soon_count);
                             s_bus_use_api_candidates = true;
                             s_bus_target_count = soon_count; s_bus_matched_count = 0;
+                            send_bus_candidates(s_bus_api_candidate_count);   // 버스모드 진입(0xB1 시작) 직전에 1회
+                            // 후보 안내: "937" "503" ... "도착예정" (큐 순서대로 재생되고,
+                            // 그 뒤에 enter_mode가 넣는 "버스탐지모드전환"이 이어서 나옴).
+                            // 큐가 넘치지 않게 노선은 최대 3개까지만 말한다.
+                            {
+                                int announce = s_bus_api_candidate_count < 3 ? s_bus_api_candidate_count : 3;
+                                for (int i = 0; i < announce; i++) {
+                                    queue_voice_clip(s_bus_api_candidates[i].route_no);
+                                }
+                                queue_voice_clip("도착예정");
+                            }
                             enter_mode(CaneMode::BUS);
                         }
                     }
@@ -2178,6 +2160,15 @@ static void cane_mode_task(void *arg) {
                 s_fall_alert_active = false;
                 ESP_LOGI(TAG, "낙상 알림 반복 정지 (0x0B)");
             }
+            else if (cmd == CMD_RETRY_PROMPT) {
+                queue_voice_clip("다시말씀해주세요");
+            }
+            else if (cmd == CMD_TOF_BEEP) {
+                uint8_t hd[2];
+                if (usb_cdc_read_tof_beep_payload(hd)) {
+                    queue_tof_beep(hd[0], hd[1]);   // 재생은 audio_task가 담당
+                }
+            }
         }
 
         int64_t elapsed = esp_timer_get_time() - s_mode_enter_us;
@@ -2207,7 +2198,7 @@ static void cane_mode_task(void *arg) {
             if (matched) {
                 queue_voice_clip(s_bus_last_match);   // "937" 등 버스번호 안내
                 s_bus_matched_count++;
-                // 2026-08-26: 매칭된 순간 바로 전환하지 않고 1초 지연 (요청).
+                // 매칭된 순간 바로 전환하지 않고 1초 지연 (요청).
                 // 정류장 게이팅에서 잡힌 도착예정 대수(s_bus_target_count)를
                 // 아직 다 못 채웠으면 장애물모드로 안 돌아가고 버스모드를
                 // 새로 재진입 — enter_mode(BUS)가 이미 로드된 det/rec 모델은
@@ -2251,9 +2242,9 @@ static void cane_mode_task(void *arg) {
             // "충분히 가까이 왔다"는 확정 신호가 있어야 돌아간다. 이러면 재전환 빈도가
             // 자연스럽게 낮아져서 6MB 장애물 arena 재구성도 덜 일어난다 (2026-08-15 개발기록).
             bool near = s_bb.valid && (s_bb.w * s_bb.h > 0.15f);
-            send_braille_result(s_bb.valid, s_bb.conf, near);
+            send_braille_result(s_bb.valid, s_bb.conf, near, s_bb.dir);
             if (near) {
-                // 2026-08-26: 근접확정 시 방향(s_bb.dir: left/center/right)에 맞는
+                // 근접확정 시 방향(s_bb.dir: left/center/right)에 맞는
                 // 클립 안내 추가 — 그동안 이 케이스엔 음성이 아예 없었음.
                 if (strcmp(s_bb.dir, "left") == 0)       queue_voice_clip("왼쪽에점자블록");
                 else if (strcmp(s_bb.dir, "right") == 0) queue_voice_clip("오른쪽에점자블록");
@@ -2459,12 +2450,13 @@ extern "C" void app_main(void)
     ir_gpio_init();
     spk_init();
 
-    // 2026-08-24: 음성 재생 전용 태스크 — video_push_task와 같은 core0에 고정한다.
+    // 음성 재생 전용 태스크 — video_push_task와 같은 core0에 고정한다.
     // cane_mode_task(core1, 추론)와는 물리적으로 분리돼서 음성 재생(블로킹) 중에도
     // 추론이 안 멈춘다. video_push_task(우선순위2)보다 살짝 높은 우선순위(3)를 줘서
     // 오디오가 필요할 때 JPEG 인코딩보다 먼저 스케줄되게 한다 (완전히 안 겹치는
     // 건 아니지만, core1의 추론과 얽히는 것보다 훨씬 가벼운 충돌 — 8.24개발기록 참고).
-    s_audio_queue = xQueueCreate(4, AUDIO_QUEUE_KEY_LEN);
+    s_beep_queue = xQueueCreate(1, sizeof(TofBeepReq));   // TOF 비프: 최신 1건만 유지
+    s_audio_queue = xQueueCreate(8, AUDIO_QUEUE_KEY_LEN);   // 버스 후보 안내(최대 3노선+도착예정)+모드전환 클립이 한꺼번에 들어가서 4→8
     xTaskCreatePinnedToCore(audio_task, "audio_task", 4096, NULL, 3, NULL, 0);
 
     // 카메라를 먼저 초기화해야 한다. 조도센서와 I2C 버스를 공유하는데

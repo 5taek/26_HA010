@@ -43,8 +43,10 @@ static const VoiceClip VOICE_CLIPS[] = {
     {"왼쪽에점자블록",          1948800,  111360},  // dir="left"
     {"오른쪽에점자블록",         2060160,  111360},  // dir="right"
     {"낙상감지",             2171520,  65280},  // CMD_FALL_ALERT_START(0x0A) 무한반복, CMD_FALL_ALERT_STOP(0x0B)로 정지
+    {"도착예정",             2236800,  76800},  // 버스 후보 안내: "937" "503" ... 다음에 이어서 재생
+    {"다시말씀해주세요",       2313600,  78720},  // CMD_RETRY_PROMPT(0x0C) — 키워드 인식 실패/시간초과 시
 };
-static const int VOICE_CLIPS_COUNT = 26;
+static const int VOICE_CLIPS_COUNT = 28;
 
 // 전체 voice.bin 크기 (참고용, 파티션 크기 정할 때 여유 계산에 씀)
-static const uint32_t VOICE_BIN_TOTAL_BYTES = 2236800;  // voice 파티션 2304K
+static const uint32_t VOICE_BIN_TOTAL_BYTES = 2392320;  // voice 파티션 2400K
