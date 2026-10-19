@@ -32,6 +32,42 @@ static esp_err_t DRV_Write(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t val
 // BIDIR_INPUT=0(단방향)으로 바꿔서 0%=진짜 꺼짐, 100%=정격전압 정방향이 되게 함.
 #define DRV_CONTROL2      0x75 // 0xF5에서 bit7(BIDIR_INPUT)만 0으로
 
+static esp_err_t DRV_Read(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *value)
+{
+    return i2c_master_transmit_receive(dev, &reg, 1, value, 1, 100);
+}
+
+// 설정이 실제로 DRV2605에 들어갔는지 읽어서 로그로 남긴다 (쓰기가 성공해도 값이 다를 수 있음).
+// 왼쪽/오른쪽 모터가 안 울릴 때 "칩 설정 문제인지, 배선/모터 문제인지"를 가르는 용도.
+// 기대값: mode 0x03, feedback 0xB6, rated 0x59, odclamp 0x6C, control2 0x75, control3 0x00
+static bool DRV_Verify(i2c_master_dev_handle_t dev, const char *name)
+{
+    if (dev == NULL) {
+        ESP_LOGE(TAG, "%s 핸들 없음 (bind 실패)", name);
+        return false;
+    }
+    uint8_t status = 0, mode = 0, fb = 0, rated = 0, odc = 0, c2 = 0, c3 = 0;
+    const esp_err_t e0 = DRV_Read(dev, 0x00, &status);
+    const esp_err_t e1 = DRV_Read(dev, 0x01, &mode);
+    const esp_err_t e2 = DRV_Read(dev, 0x1A, &fb);
+    const esp_err_t e3 = DRV_Read(dev, 0x16, &rated);
+    const esp_err_t e4 = DRV_Read(dev, 0x17, &odc);
+    const esp_err_t e5 = DRV_Read(dev, 0x1C, &c2);
+    const esp_err_t e6 = DRV_Read(dev, 0x1D, &c3);
+    if (e0 || e1 || e2 || e3 || e4 || e5 || e6) {
+        ESP_LOGE(TAG, "%s 레지스터 읽기 실패 (0x00=%s 0x01=%s 0x1A=%s 0x16=%s 0x17=%s 0x1C=%s 0x1D=%s) - 배선/풀업/전원 확인",
+                 name, esp_err_to_name(e0), esp_err_to_name(e1), esp_err_to_name(e2), esp_err_to_name(e3),
+                 esp_err_to_name(e4), esp_err_to_name(e5), esp_err_to_name(e6));
+        return false;
+    }
+    const bool ok = (mode == 0x03) && (fb == 0xB6) && (rated == DRV_RATED_VOLTAGE) &&
+                    (odc == DRV_OD_CLAMP) && (c2 == DRV_CONTROL2) && (c3 == 0x00);
+    ESP_LOGI(TAG, "%s 읽기확인: status=0x%02X(칩ID=%u) mode=0x%02X fb=0x%02X rated=0x%02X odc=0x%02X ctl2=0x%02X ctl3=0x%02X -> %s",
+             name, status, (unsigned)(status >> 5), mode, fb, rated, odc, c2, c3,
+             ok ? "설정 OK" : "설정이 기대값과 다름");
+    return ok;
+}
+
 // Simple LEDC-based haptic driver
 void DRV_INIT(void)
 {
@@ -67,6 +103,10 @@ void DRV_INIT(void)
     } else {
         ESP_LOGE(TAG, "DRV1 bind failed on I2C1");
     }
+
+    // 두 칩 모두 설정이 실제로 들어갔는지 읽어서 확인 (모터가 안 울릴 때 원인 분리용)
+    DRV_Verify(DRV_dev1, "DRV0(우)");
+    DRV_Verify(DRV_dev2, "DRV1(좌)");
 }
 
 void DRV_PWM_INIT(void)

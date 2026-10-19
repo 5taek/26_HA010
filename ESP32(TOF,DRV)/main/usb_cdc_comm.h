@@ -33,10 +33,16 @@ extern "C" {
 // ════════════════════════════════════════════════════════════
 #define SMARTCANE_MSG_TYPE_RAW_GRID     0xB2
 #define SMARTCANE_MSG_TYPE_HAPTIC_FIRED 0xB3
+#define SMARTCANE_MSG_TYPE_TOP_GRID     0xB4  // 상단 센서(TOF0) 4x4 원본 그리드 (33바이트)
 
 #define SMARTCANE_RAW_GRID_ROWS  8    // TOF1 단독 8x8 해상도 기준 (TOF0 잠금 모드)
 #define SMARTCANE_RAW_GRID_COLS  8
 #define SMARTCANE_RAW_GRID_CELLS (SMARTCANE_RAW_GRID_ROWS * SMARTCANE_RAW_GRID_COLS) // 64
+
+// 상단 센서(TOF0, I2C0) 4x4 = 16칸. row-major(row*4+col). 머리 구역 판정은 row0~1, col1~2만 쓴다.
+#define SMARTCANE_TOP_GRID_ROWS  4
+#define SMARTCANE_TOP_GRID_COLS  4
+#define SMARTCANE_TOP_GRID_CELLS (SMARTCANE_TOP_GRID_ROWS * SMARTCANE_TOP_GRID_COLS) // 16
 
 #pragma pack(push, 1)
 typedef struct {
@@ -50,6 +56,11 @@ typedef struct {
     uint8_t direction;      // 0=LEFT 1=CENTER 2=RIGHT
     int16_t distance_mm;    // 트리거 시점의 거리
 } smartcane_haptic_fired_packet_t; // 5 bytes
+
+typedef struct {
+    uint8_t msg_type;                                  // 항상 SMARTCANE_MSG_TYPE_TOP_GRID (0xB4)
+    int16_t distance_mm[SMARTCANE_TOP_GRID_CELLS];      // row-major, 무효 칸은 -1
+} smartcane_top_grid_packet_t; // 1 + 16*2 = 33 bytes
 #pragma pack(pop)
 
 esp_err_t UsbCdcComm_Init(void);
@@ -60,6 +71,9 @@ esp_err_t UsbCdcComm_SendRawGrid(const int16_t distance_mm[SMARTCANE_RAW_GRID_CE
 
 // 실제로 진동이 발화된 시점에 해당 구역 정보를 RPi에 전송합니다.
 esp_err_t UsbCdcComm_SendHapticFired(uint8_t height, uint8_t direction, int16_t distance_mm);
+
+// 상단 센서 4x4 그리드(16칸)를 RPi에 전송합니다. 무효 칸은 -1.
+esp_err_t UsbCdcComm_SendTopGrid(const int16_t distance_mm[SMARTCANE_TOP_GRID_CELLS]);
 
 #ifdef __cplusplus
 }

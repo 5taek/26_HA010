@@ -27,7 +27,8 @@ static const char *TAG_MAIN = "MAIN";
 //
 // ⚠️ 측정 모드에서는 RPi 연동 테스트가 불가능하다.
 // ════════════════════════════════════════════════════════════
-#define SMARTCANE_MEASURE_MODE 0
+// ⚠️ 매크로 정의는 TOF_task.h로 옮겼다 (TOF_task.cc의 그리드 디버그 출력도 이 값을 봐야 해서).
+// RPi 통신하려면 TOF_task.h에서 SMARTCANE_MEASURE_MODE를 0으로 둘 것.
 
 // ⚠️ 개발용 스위치 — 알려진 센서 고장(예: TOF1 모듈 불량)이 있는 상태로 계속
 // 개발/테스트할 때, 부팅마다 + 15초마다 울리는 고장 알림 진동이 방해가 될 수 있어
@@ -75,6 +76,20 @@ static void init_task_watchdog(void)
         ESP_LOGI(TAG_MAIN, "태스크 워치독 활성화 (timeout=%dms, panic=on)", TWDT_TIMEOUT_MS);
     }
 }
+
+// ════════════════════════════════════════════════════════════
+// 코어 배정 (2026-10-13)
+//   Core 1 (CORE_SAFETY): 안전 경로 전부 — ToF 2개 읽기/판정 + 햅틱 2개 재생.
+//       USB/로그/시스템 태스크와 CPU를 나눠 쓰지 않아서, RPi가 느리거나 로그가 많아도
+//       장애물 판정과 진동 타이밍이 흔들리지 않는다.
+//   Core 0 (CORE_COMM): USB 전송(0xB2/0xB3), 고장 알림 태스크, 그리고 시스템 태스크(Wi-Fi/BT는
+//       안 쓰지만 USB 인터럽트, esp_timer 등). USB 드라이버는 app_main(Core 0)에서 설치되므로
+//       그 ISR이 Core 0에서 돈다 -> USB 송신 태스크도 Core 0에 둔다.
+//   ToF 두 태스크는 g_tof_state_mutex(크로스코어 안전)로 공유 격자를 보호하고,
+//   고장 마스크는 TOF_task.cc의 스핀락 헬퍼로 갱신한다.
+// ════════════════════════════════════════════════════════════
+#define CORE_COMM   0
+#define CORE_SAFETY 1
 
 static void start_task_pinned(TaskFunction_t task, const char *name, uint32_t stack_size, UBaseType_t priority, BaseType_t core_id)
 {
@@ -147,27 +162,27 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG_MAIN, "\n════ 데이터 스트림 태스크 생성 ════");
 
 #if !SMARTCANE_TOF0_DISABLED
-    start_task_pinned(TOF0_TASK, "TOF0_TASK", 8192, 5, 0);
+    start_task_pinned(TOF0_TASK, "TOF0_TASK", 8192, 5, CORE_SAFETY);
 #else
     ESP_LOGW(TAG_MAIN, "TOF0_DISABLED=1 - TOF0_TASK 미기동 (TOF1 8x8 단독 모드)");
 #endif
-    start_task_pinned(TOF1_TASK, "TOF1_TASK", 8192, 5, 0);
-    start_task_pinned(HAPTIC0_TASK, "HAPTIC0", 4096, 5, 0);
-    start_task_pinned(HAPTIC1_TASK, "HAPTIC1", 4096, 5, 0);
+    start_task_pinned(TOF1_TASK, "TOF1_TASK", 8192, 5, CORE_SAFETY);
+    start_task_pinned(HAPTIC0_TASK, "HAPTIC0", 4096, 5, CORE_SAFETY);
+    start_task_pinned(HAPTIC1_TASK, "HAPTIC1", 4096, 5, CORE_SAFETY);
 #if !SMARTCANE_MEASURE_MODE
     // ToF가 감지한 알림을 USB로 실제 전송하는 태스크들.
     // 예전엔 ToF 태스크가 뮤텍스를 쥔 채로 직접 USB write를 했는데, RPi가 느리거나
     // 안 읽으면 그 동안 거리 측정 루프 전체가 멈추는 구조였음 -> 분리함.
     // (측정 모드에서는 안 띄운다 — 이 태스크들이 전송 시점에 UsbCdcComm_Init을 다시 부르기 때문.
     //  알림 큐는 xQueueOverwrite라 소비자가 없어도 ToF는 막히지 않는다.)
-    start_task_pinned(ALERT_SENDER_TASK, "ALERT_TX", 4096, 3, 0);
+    start_task_pinned(ALERT_SENDER_TASK, "ALERT_TX", 4096, 3, CORE_COMM);
     // 원본 그리드는 129바이트짜리 구조체를 스택에 두고 직렬화하므로 여유 있게 스택을 준다.
-    start_task_pinned(GRID_STREAM_TASK, "GRID_STREAM", 4096, 3, 0);
+    start_task_pinned(GRID_STREAM_TASK, "GRID_STREAM", 4096, 3, CORE_COMM);
 #endif
 #if !SMARTCANE_SUPPRESS_FAULT_HAPTIC
     // 센서 고장이 지속되면 15초마다 구분되는 진동으로 사용자에게 알리는 태스크.
     // 우선순위를 낮게 둬서 실제 장애물 경고 경로를 방해하지 않는다.
-    start_task_pinned(TOF_FAULT_NOTIFY_TASK, "TOF_FAULT", 2560, 2, 0);
+    start_task_pinned(TOF_FAULT_NOTIFY_TASK, "TOF_FAULT", 2560, 2, CORE_COMM);
 #else
     ESP_LOGW(TAG_MAIN, "SUPPRESS_FAULT_HAPTIC=1 - 15초 고장 알림 진동 태스크 미기동");
 #endif

@@ -78,6 +78,30 @@ esp_err_t UsbCdcComm_SendRawGrid(const int16_t distance_mm[SMARTCANE_RAW_GRID_CE
     return send_err;
 }
 
+esp_err_t UsbCdcComm_SendTopGrid(const int16_t distance_mm[SMARTCANE_TOP_GRID_CELLS])
+{
+    if (!s_usb_ready) {
+        const esp_err_t init_err = UsbCdcComm_Init();
+        if (init_err != ESP_OK) {
+            return init_err;
+        }
+    }
+
+    smartcane_top_grid_packet_t packet;
+    packet.msg_type = SMARTCANE_MSG_TYPE_TOP_GRID;
+    memcpy(packet.distance_mm, distance_mm, sizeof(packet.distance_mm));
+
+    if (s_usb_write_mutex != nullptr) {
+        xSemaphoreTake(s_usb_write_mutex, portMAX_DELAY);
+    }
+    const esp_err_t send_err = usb_write_all(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
+    if (s_usb_write_mutex != nullptr) {
+        xSemaphoreGive(s_usb_write_mutex);
+    }
+
+    return send_err;
+}
+
 esp_err_t UsbCdcComm_SendHapticFired(uint8_t height, uint8_t direction, int16_t distance_mm)
 {
     if (!s_usb_ready) {

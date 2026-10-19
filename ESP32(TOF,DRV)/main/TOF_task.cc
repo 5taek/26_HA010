@@ -67,6 +67,23 @@ typedef struct {
 // 무시하도록 이미 설계돼 있어서, TOF0을 통째로 안 쓰는 지금 상황도 별도 처리 없이
 // "센서 하나가 계속 고장난 상태"로 자연스럽게 취급된다.
 static raw_cell_t g_raw_grid[SMARTCANE_RAW_GRID_ROWS][SMARTCANE_RAW_GRID_COLS];
+
+// ════════════════════════════════════════════════════════════
+// 듀얼 센서 구성 (2026-10-13, 센서 2개 복귀)
+//   TOF1 = I2C1(SDA3/SCL4), 8x8, 중·하단 담당 -> g_raw_grid (RPi 0xB2로도 이 8x8을 그대로 보냄)
+//   TOF0 = I2C0(SDA5/SCL6), 4x4, 상단 담당     -> g_top_grid (4x4 중 위 TOP_USE_ROWS줄만 TOP 판정에 사용)
+// 이전(센서 1개) 코드는 backup/main_20261013_single_tof/ 에 백업돼 있다.
+// ════════════════════════════════════════════════════════════
+#define HALF_MIDLOW 0  // TOF1 (8x8)
+#define HALF_TOP    1  // TOF0 (4x4)
+
+#define TOP_GRID_ROWS 4
+#define TOP_GRID_COLS 4
+// 상단 센서에서 TOP 판정에 쓸 줄(센서 row 0..TOP_USE_ROWS-1). 센서를 거꾸로 달았다면
+// TOP_ROW_START를 2로(= row 2~3 사용) 바꿀 것.
+#define TOP_ROW_START 0
+#define TOP_USE_ROWS  2
+static raw_cell_t g_top_grid[TOP_GRID_ROWS][TOP_GRID_COLS];
 static zone_cell_t g_zone_grid[3][3];     // [height][direction] 논리 3x3 구역 (햅틱 트리거 전용)
 static SemaphoreHandle_t g_tof_state_mutex = nullptr;
 
@@ -138,10 +155,24 @@ static bool take_eval_round_locked(void)
 }
 
 // TOF1 단독 8x8 해상도 기준 (TOF0 잠금 모드). 위 "3x3 구역 매핑" 주석 참고.
-static const int kHeightRowStart[3] = {0, 1, 6};
-static const int kHeightRowEnd[3]   = {0, 5, 7};
-static const int kDirColStart[3]    = {0, 2, 6};
-static const int kDirColEnd[3]      = {1, 5, 7};
+// 듀얼 센서 구성: TOP은 TOF0(4x4) 위쪽 줄에서, MID/BOTTOM은 TOF1(8x8)에서 판정한다.
+// [h] 순서 = TOP, MID, BOTTOM. TOP 칸은 g_top_grid를 쓰므로 8x8용 행 범위는 쓰지 않는다.
+//   TOF1 8x8: MID = row0~2, BOTTOM = row2~3 (row 2는 두 구역이 겹침)  <- 실측 후 조정할 것
+//   (2026-10-13 실측: row 5~7은 바닥 반사(약 800~1370mm), row 4도 바닥 근처(1430~1800mm)라서 제외.
+//    센서를 위로 기울여 바닥이 빠지면 MID를 row0~4로, BOTTOM을 row5~6 등으로 다시 열 것)
+static const int kHeightRowStart[3] = {0, 0, 2};
+static const int kHeightRowEnd[3]   = {-1, 2, 3};
+// 8x8 열 구분: 좌 col1-2 / 정면 col3-4 / 우 col5-6  (가장자리 col0, col7은 옆 물체가 섞여 제외)
+// ⚠️ 2026-10-13: 예전엔 좌 col1 / 정면 col2-5 / 우 col6 이었는데, 정면이 4열로 넓고 좌우가 1열뿐이라
+// 옆 장애물이 거의 항상 정면 구역(col2~)에도 같이 걸렸다. 정면 우선 규칙 때문에 좌/우 단독 진동이
+// 거의 안 나고 항상 양쪽이 울렸음 -> 좌/정면/우를 2열씩 동일 폭(약 11도)으로 맞춤.
+static const int kDirColStart[3]    = {1, 3, 5};
+static const int kDirColEnd[3]      = {2, 4, 6};
+// 4x4(상단 센서): 머리 높이는 좌/우 구분 없이 가운데 2열(col1~2)만 본다.
+// 그래서 TOP은 CENTER 구역 하나만 존재하고(LEFT/RIGHT는 항상 비활성), CENTER는 양쪽 모터가
+// 같이 울리는 경로라 머리 경고는 자연스럽게 좌우 구분 없이 양쪽이 울린다.
+#define TOP_COL_START 1
+#define TOP_COL_END   2
 
 // Readme 4.2: 구역(높이)별 위험 판정 임계거리 — 상단이 가장 멀리서부터 위험으로 간주
 // ⚠️ 2026-08-15 실측 후 상향 조정: 원래 값(2500/1800/1500)으로 실제로 걸어서 테스트해보니
@@ -150,7 +181,7 @@ static const int kDirColEnd[3]      = {1, 5, 7};
 // 센서 기준 임계거리에서 실제로는 400mm를 더 빼고 생각해야 함. 그만큼 여유를 두고 전부
 // 500mm씩 올림. HAPTIC_COOLDOWN_MS도 같이 낮춰서 재경고 주기를 단축했음 — 이 둘은
 // 세트로 튜닝된 값이라 하나만 되돌리지 말 것.
-static const int16_t kHeightDangerThresholdMm[3] = { 3000, 2300, 2000 }; // top, mid, bottom
+static const int16_t kHeightDangerThresholdMm[3] = { 1300, 1800, 1500 }; // top, mid, bottom (2026-10-13 사용자 지정: 머리 1.3m / 중단 1.8m / 하단 1.5m, MID·BOTTOM은 20cm 상향)
 
 // Readme 4.1: 위험도 점수 = 거리점수 + 높이가중치 + 방향가중치
 static const int kHeightWeight[3] = { 30, 20, 10 }; // top > mid > bottom
@@ -178,71 +209,207 @@ static const int kDirWeight[3]    = { 10, 20, 10 }; // left, center, right (cent
 // 주의: 여기서는 "센서가 유효한 값을 리턴했는가"만 판정하고, "위험한 거리인가"는 판정하지 않는다.
 // (예전 코드는 여기서 120~700mm로 하드컷을 걸어서 VL53L5CX의 실제 측정범위(~4m)를
 //  전혀 활용하지 못했음 — 그 버그를 고친 부분)
-static void ingest_sensor_rows_locked(const VL53L5CX_ResultsData *results, int row_offset)
+static bool tof_cell_valid(const VL53L5CX_ResultsData *results, int i, int16_t *out_d)
 {
-    for (int i = 0; i < VL53L5CX_RESOLUTION_8X8; ++i) {
-        const int local_row = i / SMARTCANE_RAW_GRID_COLS;
-        const int col = i % SMARTCANE_RAW_GRID_COLS;
-        const int idx = i * VL53L5CX_NB_TARGET_PER_ZONE;
-        const int16_t d = results->distance_mm[idx];
-        const uint8_t st = results->target_status[idx];
-        const uint8_t nt = results->nb_target_detected[i];
-        const uint32_t sig = results->signal_per_spad[idx];
+    const int idx = i * VL53L5CX_NB_TARGET_PER_ZONE;
+    const int16_t d = results->distance_mm[idx];
+    const uint8_t st = results->target_status[idx];
+    const uint8_t nt = results->nb_target_detected[i];
+    const uint32_t sig = results->signal_per_spad[idx];
 
-        // VL53L5CX 실측 유효범위(대략 40mm~4000mm)만 걸러낸다. "위험" 여부는
-        // recompute_zone_grid_locked()에서 높이별 임계치(kHeightDangerThresholdMm)로 별도 판정.
-        const bool valid = (nt > 0) && (st == 5 || st == 9) && (d >= 40 && d <= 4000) && (sig >= 40);
-
-        raw_cell_t &cell = g_raw_grid[row_offset + local_row][col];
-        cell.valid = valid;
-        cell.distance_mm = valid ? d : (int16_t)-1;
-    }
-
-    // 이 절반이 방금 갱신됐다고 기록 (stale 판정 + 측정 회차 기준)
-    const int half = row_offset ? 1 : 0;
-    g_half_fresh_tick[half] = xTaskGetTickCount();
-    g_half_seq[half]++;
+    // VL53L5CX 실측 유효범위(대략 40mm~4000mm)만 걸러낸다. "위험" 여부는
+    // recompute_zone_grid_locked()에서 높이별 임계치(kHeightDangerThresholdMm)로 별도 판정.
+    const bool valid = (nt > 0) && (st == 5 || st == 9) && (d >= 40 && d <= 4000) && (sig >= 40);
+    *out_d = valid ? d : (int16_t)-1;
+    return valid;
 }
 
-// 8x8 원시 배열(TOF1 단독) -> 3x3 논리 구역으로 축약, 높이별 위험 임계거리 적용.
+// ════════════════════════════════════════════════════════════
+// 정확도 개선 파라미터 (2026-10-13)
+//  1) 히스테리시스: 한번 켜진 구역은 임계값 + ZONE_HYSTERESIS_MM까지 켜진 채로 둔다
+//     (임계값 근처에서 켜졌다 꺼졌다 하며 반복 진동하는 것 방지)
+//  2) 시간축 필터: 칸마다 최근 3프레임의 중앙값을 쓴다 (한 프레임 튄 값 제거)
+//  4) 접근 속도 기반 확장: 구역 최소거리가 가까워지는 속도가 빠를수록 임계값을 늘린다
+//     (남은 시간 ~ 거리/속도 가 일정하도록). 정지/느림이면 기본 임계값 그대로.
+// ════════════════════════════════════════════════════════════
+#define ZONE_HYSTERESIS_MM   150
+
+#define TTC_ENABLE           1
+#define TTC_EXTRA_S          0.6f   // 접근 속도(mm/s) x 이 시간(s) = 임계값에 더해줄 거리
+#define TTC_MAX_EXTRA_MM     600    // 확장 상한
+#define TTC_MIN_SPEED_MM_S   400    // 이보다 느린 접근은 노이즈로 보고 무시
+#define TTC_EMA_ALPHA        0.25f  // 속도 평활 계수 (작을수록 부드럽고 느리게 반응)
+
+#define TOF_MEDIAN_INVALID   32767
+
+typedef struct {
+    int16_t h[3][64];   // 최근 3프레임(무효는 TOF_MEDIAN_INVALID)
+    uint8_t idx;
+    bool primed;
+} cell_hist_t;
+
+static cell_hist_t s_hist_midlow = {};
+static cell_hist_t s_hist_top    = {};
+
+static inline int16_t median3(int16_t a, int16_t b, int16_t c)
+{
+    const int16_t lo = (a < b) ? a : b;
+    const int16_t hi = (a < b) ? b : a;
+    const int16_t m  = (c < hi) ? c : hi;
+    return (lo > m) ? lo : m;
+}
+
+// 새 프레임을 히스토리에 넣고 칸별 3프레임 중앙값을 dst(row-major)에 쓴다.
+// 무효 칸은 INVALID(아주 큰 값)로 취급해서, 3프레임 중 2프레임 이상 무효일 때만 무효가 된다.
+// (한 프레임 튄 값은 중앙값에서 사라지고, 가까운 장애물은 2프레임 연속 보이면 반영된다.)
+static void ingest_filtered(cell_hist_t *hs, int hf, const VL53L5CX_ResultsData *results, int n, raw_cell_t *dst)
+{
+    if (half_is_stale_locked(hf)) {
+        hs->primed = false; // 갱신이 한동안 끊겼으면 오래된 프레임을 섞지 않는다
+    }
+
+    int16_t cur[64];
+    for (int i = 0; i < n; ++i) {
+        int16_t d;
+        cur[i] = tof_cell_valid(results, i, &d) ? d : (int16_t)TOF_MEDIAN_INVALID;
+    }
+
+    if (!hs->primed) {
+        for (int k = 0; k < 3; ++k) {
+            memcpy(hs->h[k], cur, sizeof(int16_t) * n);
+        }
+        hs->idx = 0;
+        hs->primed = true;
+    } else {
+        memcpy(hs->h[hs->idx], cur, sizeof(int16_t) * n);
+        hs->idx = (uint8_t)((hs->idx + 1) % 3);
+    }
+
+    for (int i = 0; i < n; ++i) {
+        const int16_t m = median3(hs->h[0][i], hs->h[1][i], hs->h[2][i]);
+        dst[i].valid = (m != (int16_t)TOF_MEDIAN_INVALID);
+        dst[i].distance_mm = dst[i].valid ? m : (int16_t)-1;
+    }
+}
+
+// TOF1(I2C1, 중·하단 담당, 8x8) -> g_raw_grid 전체 8행. half 0.
+static void ingest_midlow_8x8_locked(const VL53L5CX_ResultsData *results)
+{
+    ingest_filtered(&s_hist_midlow, HALF_MIDLOW, results, VL53L5CX_RESOLUTION_8X8, &g_raw_grid[0][0]);
+    g_half_fresh_tick[HALF_MIDLOW] = xTaskGetTickCount();
+    g_half_seq[HALF_MIDLOW]++;
+}
+
+// TOF0(I2C0, 상단 담당, 4x4) -> g_top_grid 16칸. half 1. 판정에는 위 TOP_USE_ROWS 줄만 쓴다.
+static void ingest_top_4x4_locked(const VL53L5CX_ResultsData *results)
+{
+    ingest_filtered(&s_hist_top, HALF_TOP, results, VL53L5CX_RESOLUTION_4X4, &g_top_grid[0][0]);
+    g_half_fresh_tick[HALF_TOP] = xTaskGetTickCount();
+    g_half_seq[HALF_TOP]++;
+}
+
+// 구역별 접근 속도 추적 상태 (g_tof_state_mutex 보호)
+static int16_t    s_zone_prev_min[3][3] = { {-1,-1,-1}, {-1,-1,-1}, {-1,-1,-1} };
+static float      s_zone_speed[3][3]    = {};   // mm/s, 양수 = 가까워지는 중
+static int16_t    s_zone_extra_mm[3][3] = {};
+static TickType_t s_vel_tick[2]         = { 0, 0 };
+static uint32_t   s_vel_seq[2]          = { 0, 0 };
+
+// 센서 원시 배열 -> 3x3 논리 구역으로 축약, 높이별 위험 임계거리 적용.
 // g_tof_state_mutex 보호 하에 호출.
 static void recompute_zone_grid_locked(void)
 {
     // 갱신이 끊긴 절반은 이번 계산에서 통째로 없는 셈 친다 (위 TOF_DATA_STALE_MS 주석 참고)
-    const bool half_stale[2] = { half_is_stale_locked(0), half_is_stale_locked(1) };
+    const bool half_stale[2] = { half_is_stale_locked(HALF_MIDLOW), half_is_stale_locked(HALF_TOP) };
 
+    // ── 1단계: 구역별 최소거리(임계값과 무관하게 유효한 칸 중 최솟값) ──
+    int16_t min_all[3][3];
     for (int h = 0; h < 3; ++h) {
-        const int16_t danger_threshold = kHeightDangerThresholdMm[h];
+        const bool is_top = (h == ZONE_HEIGHT_TOP);
 
         for (int dir = 0; dir < 3; ++dir) {
-            int hit_count = 0;
             int16_t min_d = -1;
 
-            for (int r = kHeightRowStart[h]; r <= kHeightRowEnd[h]; ++r) {
-                // ⚠️ TOF0 잠금 모드: 8행 전체가 TOF1(half 0) 하나뿐이다. 예전엔
-                // "r < ROWS/2 ? 0 : 1"로 앞/뒤 절반을 다른 센서로 나눴는데, 지금은
-                // 센서가 하나뿐이라 그 계산을 쓰면 뒷줄(BOTTOM 구역)이 엉뚱하게
-                // half 1(잠긴 TOF0, 항상 stale)로 잡혀 BOTTOM이 절대 활성화 못 되는
-                // 버그가 난다. 그래서 모든 행을 half 0으로 고정한다.
-                if (half_stale[0]) {
+            // TOP은 상단 센서(TOF0, 4x4) 위쪽 TOP_USE_ROWS줄, MID/BOTTOM은 TOF1(8x8)에서 읽는다.
+            // 해당 센서가 stale(고장/갱신 끊김)이면 그 높이 구역은 통째로 무효로 둔다.
+            const int row_begin = is_top ? TOP_ROW_START : kHeightRowStart[h];
+            const int row_end   = is_top ? (TOP_ROW_START + TOP_USE_ROWS - 1) : kHeightRowEnd[h];
+            const int col_begin = is_top ? TOP_COL_START : kDirColStart[dir];
+            const int col_end   = is_top ? TOP_COL_END   : kDirColEnd[dir];
+            // TOP은 CENTER 하나뿐 — LEFT/RIGHT는 보지 않는다(같은 칸이 3번 세어지는 것도 방지).
+            const bool stale    = (is_top ? half_stale[HALF_TOP] : half_stale[HALF_MIDLOW])
+                                  || (is_top && dir != ZONE_DIR_CENTER);
+
+            for (int r = row_begin; r <= row_end; ++r) {
+                if (stale) {
                     continue;
                 }
-                for (int c = kDirColStart[dir]; c <= kDirColEnd[dir]; ++c) {
-                    const raw_cell_t &cell = g_raw_grid[r][c];
-                    // 이 높이 구역 자체의 위험 임계거리 이내인 hit만 카운트
-                    if (cell.valid && cell.distance_mm <= danger_threshold) {
-                        hit_count++;
-                        if (min_d < 0 || cell.distance_mm < min_d) {
-                            min_d = cell.distance_mm;
-                        }
+                for (int c = col_begin; c <= col_end; ++c) {
+                    const raw_cell_t &cell = is_top ? g_top_grid[r][c] : g_raw_grid[r][c];
+                    if (cell.valid && (min_d < 0 || cell.distance_mm < min_d)) {
+                        min_d = cell.distance_mm;
                     }
                 }
             }
+            min_all[h][dir] = min_d;
+        }
+    }
 
+    // ── 2단계: 접근 속도 갱신 (센서가 새 프레임을 준 때만, 센서별로 한 번) ──
+#if TTC_ENABLE
+    const TickType_t now_tick = xTaskGetTickCount();
+    for (int hf = 0; hf < 2; ++hf) {
+        if (g_half_seq[hf] == s_vel_seq[hf]) {
+            continue; // 이 센서는 새 프레임이 없다 (다른 센서 태스크가 불러서 온 호출)
+        }
+        const bool first = (s_vel_tick[hf] == 0);
+        const float dt = first ? 0.0f
+                               : (float)((uint32_t)(now_tick - s_vel_tick[hf]) * portTICK_PERIOD_MS) / 1000.0f;
+        s_vel_seq[hf]  = g_half_seq[hf];
+        s_vel_tick[hf] = now_tick;
+
+        for (int h = 0; h < 3; ++h) {
+            if ((h == ZONE_HEIGHT_TOP) != (hf == HALF_TOP)) continue;
+            for (int dir = 0; dir < 3; ++dir) {
+                const int16_t prev = s_zone_prev_min[h][dir];
+                const int16_t cur  = min_all[h][dir];
+                if (!first && dt >= 0.03f && dt <= 0.5f && prev >= 0 && cur >= 0) {
+                    const float v = (float)(prev - cur) / dt; // 양수 = 가까워짐
+                    s_zone_speed[h][dir] = (1.0f - TTC_EMA_ALPHA) * s_zone_speed[h][dir] + TTC_EMA_ALPHA * v;
+                } else {
+                    s_zone_speed[h][dir] *= 0.5f; // 비교할 값이 없으면 빠르게 0으로 감쇠
+                }
+                if (s_zone_speed[h][dir] < 0.0f) s_zone_speed[h][dir] = 0.0f;
+
+                int extra = 0;
+                if (s_zone_speed[h][dir] >= (float)TTC_MIN_SPEED_MM_S) {
+                    extra = (int)(s_zone_speed[h][dir] * TTC_EXTRA_S);
+                    if (extra > TTC_MAX_EXTRA_MM) extra = TTC_MAX_EXTRA_MM;
+                }
+                s_zone_extra_mm[h][dir] = (int16_t)extra;
+                s_zone_prev_min[h][dir] = cur;
+            }
+        }
+    }
+#endif
+
+    // ── 3단계: 임계값(기본 + 접근 속도 확장 + 히스테리시스)으로 구역 활성 판정 ──
+    for (int h = 0; h < 3; ++h) {
+        for (int dir = 0; dir < 3; ++dir) {
             zone_cell_t &zc = g_zone_grid[h][dir];
-            zc.hit_count = (uint8_t)hit_count;
-            zc.active = (hit_count >= ZONE_MIN_HITS_REQUIRED);
-            zc.min_distance_mm = zc.active ? min_d : (int16_t)-1;
+            int thr = kHeightDangerThresholdMm[h];
+#if TTC_ENABLE
+            thr += s_zone_extra_mm[h][dir];
+#endif
+            if (zc.active) {
+                thr += ZONE_HYSTERESIS_MM; // 이미 켜진 구역은 조금 더 멀어질 때까지 유지
+            }
+
+            const int16_t md = min_all[h][dir];
+            const bool active = (md >= 0 && md <= thr);
+            zc.hit_count = active ? 1 : 0;
+            zc.active = active;
+            zc.min_distance_mm = active ? md : (int16_t)-1;
         }
     }
 }
@@ -329,6 +496,7 @@ void GRID_STREAM_TASK(void *pvParameters)
     (void)pvParameters;
     uint8_t trigger;
     int16_t flat[SMARTCANE_RAW_GRID_CELLS];
+    int16_t top_flat[SMARTCANE_TOP_GRID_CELLS];
 
     for (;;) {
         if (xQueueReceive(grid_stream_q, &trigger, portMAX_DELAY) != pdTRUE) {
@@ -346,13 +514,31 @@ void GRID_STREAM_TASK(void *pvParameters)
                 flat[r * SMARTCANE_RAW_GRID_COLS + c] = cell.valid ? cell.distance_mm : (int16_t)-1;
             }
         }
+        {
+            // 상단 센서(4x4)도 같이 스냅샷. 갱신이 끊긴(stale) 센서면 전부 -1로 보낸다.
+            const bool top_stale = half_is_stale_locked(HALF_TOP);
+            for (int r = 0; r < TOP_GRID_ROWS; ++r) {
+                for (int c = 0; c < TOP_GRID_COLS; ++c) {
+                    const raw_cell_t &cell = g_top_grid[r][c];
+                    top_flat[r * TOP_GRID_COLS + c] = (!top_stale && cell.valid) ? cell.distance_mm : (int16_t)-1;
+                }
+            }
+        }
         if (g_tof_state_mutex != nullptr) {
             xSemaphoreGive(g_tof_state_mutex);
         }
 
+        // ⚠️ 여기서 printf를 하면 안 된다: 콘솔이 USB Serial/JTAG로 잡혀 있으면 텍스트가
+        // 0xB2 바이너리 패킷 사이에 섞여 RPi 쪽 파싱이 깨진다.
         const esp_err_t send_err = UsbCdcComm_SendRawGrid(flat);
         if (send_err != ESP_OK) {
             ESP_LOGW(TAG, "원본 그리드 전송 실패: %s", esp_err_to_name(send_err));
+        }
+
+        // 상단 4x4 그리드(0xB4)도 같은 주기로 전송
+        const esp_err_t top_err = UsbCdcComm_SendTopGrid(top_flat);
+        if (top_err != ESP_OK) {
+            ESP_LOGW(TAG, "상단 그리드 전송 실패: %s", esp_err_to_name(top_err));
         }
     }
 }
@@ -438,10 +624,13 @@ static void update_smart_sleep(int16_t current_distance, bool any_active)
 static int compute_zone_score(int h, int dir, int16_t distance_mm)
 {
     const int16_t threshold = kHeightDangerThresholdMm[h];
-    if (distance_mm < 0 || distance_mm > threshold) {
+    if (distance_mm < 0) {
         return -1; // 비활성
     }
-    const float ratio = 1.0f - ((float)distance_mm / (float)threshold); // 0(경계)~1(바로앞)
+    // 활성 여부는 recompute_zone_grid_locked()가 이미 판정했다(접근 속도 확장/히스테리시스로
+    // 기본 임계값을 넘는 거리도 활성일 수 있음). 여기서는 점수만 계산하고 0 아래로 내리지 않는다.
+    float ratio = 1.0f - ((float)distance_mm / (float)threshold); // 0(경계)~1(바로앞)
+    if (ratio < 0.0f) ratio = 0.0f;
     const int distance_score = (int)(ratio * 50.0f);
     return distance_score + kHeightWeight[h] + kDirWeight[dir];
 }
@@ -457,7 +646,9 @@ typedef struct {
 
 static winner_track_t g_winner_track = { false, -1, -1, 0, false, -1 };
 
-#define WINNER_CONFIRM_FRAMES 2 // 이 정도 연속으로 같은 구역이 1등을 유지해야 실제 트리거
+// 칸 단위 3프레임 중앙값 필터(ingest_filtered)가 이미 "2프레임 이상 확인" 역할을 하므로
+// 여기서 또 2프레임을 기다리면 지연만 늘어난다(야외 실측에서 감지가 늦다는 문제). 1로 낮춤.
+#define WINNER_CONFIRM_FRAMES 1 // 이 정도 연속으로 같은 구역이 1등을 유지해야 실제 트리거
 
 // ⚠️ winner 전환 히스테리시스 (경고가 아예 안 나가던 구멍).
 // winner가 바뀌면 confirm_count가 1로 리셋된다. 그래서 점수가 비슷한 두 구역이
@@ -502,15 +693,22 @@ static void evaluate_zone_grid_and_act_locked(const char *source_tag)
     int best_h = -1;
     int best_dir = -1;
 
-    for (int h = 0; h < 3; ++h) {
-        for (int dir = 0; dir < 3; ++dir) {
-            const zone_cell_t &zc = g_zone_grid[h][dir];
-            if (!zc.active) continue;
-            const int score = compute_zone_score(h, dir, zc.min_distance_mm);
-            if (score > best_score) {
-                best_score = score;
-                best_h = h;
-                best_dir = dir;
+    // ⚠️ 정면(CENTER) 우선 (엄격): 정면에 켜진 구역이 하나라도 있으면 그중에서만 1등을 고른다.
+    // 점수 합산만으로는 좌/우 장애물이 거리점수 때문에 정면을 이길 수 있어서, 1차로 정면만 보고
+    // 정면이 전부 꺼져 있을 때만 2차로 좌/우를 본다. (좌/우 장애물은 정면이 비었을 때 그대로 알림)
+    for (int pass = 0; pass < 2 && best_score < 0; ++pass) {
+        for (int h = 0; h < 3; ++h) {
+            for (int dir = 0; dir < 3; ++dir) {
+                const bool is_center = (dir == ZONE_DIR_CENTER);
+                if ((pass == 0) != is_center) continue; // pass 0: 정면만, pass 1: 좌/우만
+                const zone_cell_t &zc = g_zone_grid[h][dir];
+                if (!zc.active) continue;
+                const int score = compute_zone_score(h, dir, zc.min_distance_mm);
+                if (score > best_score) {
+                    best_score = score;
+                    best_h = h;
+                    best_dir = dir;
+                }
             }
         }
     }
@@ -518,7 +716,9 @@ static void evaluate_zone_grid_and_act_locked(const char *source_tag)
     // 현재 winner가 아직 살아있다면, 도전자가 WINNER_SWITCH_MARGIN 이상 이겨야 교체한다.
     // (안 그러면 비슷한 점수의 두 구역이 번갈아 1등을 하면서 confirm_count가 계속 리셋돼
     //  둘 다 경고를 못 받는다 — 위 WINNER_SWITCH_MARGIN 주석 참고)
+    // 단, 정면 구역이 좌/우 winner를 대체하는 경우는 히스테리시스 없이 즉시 교체한다(정면 우선).
     if (best_score >= 0 && g_winner_track.active &&
+        !(best_dir == ZONE_DIR_CENTER && g_winner_track.dir != ZONE_DIR_CENTER) &&
         (g_winner_track.height != best_h || g_winner_track.dir != best_dir)) {
         const zone_cell_t &cur = g_zone_grid[g_winner_track.height][g_winner_track.dir];
         if (cur.active) {
@@ -628,10 +828,12 @@ static void evaluate_zone_grid_and_act_locked(const char *source_tag)
             xQueueOverwrite(haptic1_q, &height_payload);
         }
 
-        if (!g_alert_sleep_active) {
-            send_obstacle_alert((uint8_t)best_h, (uint8_t)best_dir,
-                                g_zone_grid[best_h][best_dir].min_distance_mm);
-        }
+        // ⚠️ 진동이 실제로 울릴 때는 스마트 슬립과 상관없이 항상 RPi(0xB3)로 알린다.
+        // 예전엔 슬립 중이면 알림을 건너뛰었는데, 진동은 그대로 울리니 RPi가 "어느 모터가 어떤
+        // 패턴으로 울렸는지"를 놓치게 된다. (direction: 0=왼쪽 모터, 1=양쪽, 2=오른쪽 모터 /
+        // height: 0=3번, 1=2번, 2=1번 패턴)
+        send_obstacle_alert((uint8_t)best_h, (uint8_t)best_dir,
+                            g_zone_grid[best_h][best_dir].min_distance_mm);
     }
 
     // 스마트 슬립은 "현재 winner 구역"의 거리를 기준으로 갱신 (없으면 비활성 처리)
@@ -642,6 +844,25 @@ static void evaluate_zone_grid_and_act_locked(const char *source_tag)
 
 // 센서 고장 마스크. bind 실패 / 펌웨어 init 실패 / 런타임 지속 정지에서 세팅된다.
 static volatile uint8_t g_tof_fault_mask = 0;
+
+// ⚠️ 센서 태스크들이 서로 다른 코어(Core 1)와 Core 0(부팅 시 app_main)에서 이 마스크를
+// 읽고-고쳐-쓰기(|=, &=) 한다. 코어가 갈라지면 두 코어가 동시에 RMW를 해서 비트가 사라질 수
+// 있으므로(예: TOF0 고장 비트를 쓰는 순간 TOF1 복귀가 덮어씀) 스핀락으로 감싼다.
+static portMUX_TYPE g_fault_mask_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static inline void fault_mask_set(uint8_t bits)
+{
+    portENTER_CRITICAL(&g_fault_mask_mux);
+    g_tof_fault_mask = (uint8_t)(g_tof_fault_mask | bits);
+    portEXIT_CRITICAL(&g_fault_mask_mux);
+}
+
+static inline void fault_mask_clear(uint8_t bits)
+{
+    portENTER_CRITICAL(&g_fault_mask_mux);
+    g_tof_fault_mask = (uint8_t)(g_tof_fault_mask & (uint8_t)~bits);
+    portEXIT_CRITICAL(&g_fault_mask_mux);
+}
 
 uint8_t TOF_GetFaultMask(void)
 {
@@ -665,12 +886,19 @@ void TOF_INIT(void)
     // Bind each TOF to its dedicated I2C bus: bus_handle (I2C0) -> TOF0, bus_handle1 (I2C1) -> TOF1
     // ⚠️ 예전엔 반환값을 버려서, 바인딩이 실패하면 platform.handle이 NULL인 채로 이후
     // 모든 I2C 호출이 그대로 진행됐다. 실패는 반드시 고장 마스크에 남긴다.
+#if SMARTCANE_TOF1_ON_I2C0
+    // 센서가 실제로는 I2C0(SDA=5/SCL=6)에 꽂혀 있는 배선용. TOF1 설정으로 I2C0에 바인딩한다.
+    if (!TOF_bind(bus_handle, &tof_dev2, &config_dev1, "TOF1(I2C0)")) {
+        fault_mask_set(TOF_FAULT_TOF1);
+    }
+#else
     if (!TOF_bind(bus_handle, &tof_dev1, &config_dev0, "TOF0")) {
-        g_tof_fault_mask |= TOF_FAULT_TOF0;
+        fault_mask_set(TOF_FAULT_TOF0);
     }
     if (!TOF_bind(bus_handle1, &tof_dev2, &config_dev1, "TOF1")) {
-        g_tof_fault_mask |= TOF_FAULT_TOF1;
+        fault_mask_set(TOF_FAULT_TOF1);
     }
+#endif
 
     // Create haptic event queues
     // Single-slot queue prevents backlog that causes long continuous vibration.
@@ -714,20 +942,20 @@ void TOF_FIRMWARE_INIT(void)
     // 사용자는 지팡이가 죽은 걸 알 방법이 없었음 — 안전장치에서는 이게 가장 나쁜 실패 방식.
 #if !SMARTCANE_TOF0_DISABLED
     if (TOF_init_with_retry(&config_dev0, "TOF0") != 0) {
-        g_tof_fault_mask |= TOF_FAULT_TOF0;
+        fault_mask_set(TOF_FAULT_TOF0);
     }
 #else
     ESP_LOGW(TAG, "TOF0_DISABLED=1 - TOF0 초기화 시도 자체를 건너뜀 (I2C0 오염 방지)");
 #endif
     if (TOF_init_with_retry(&config_dev1, "TOF1") != 0) {
-        g_tof_fault_mask |= TOF_FAULT_TOF1;
+        fault_mask_set(TOF_FAULT_TOF1);
     }
 
     if (g_tof_fault_mask != 0) {
         ESP_LOGE(TAG, "════════════════════════════════════════════");
         ESP_LOGE(TAG, " ToF 센서 이상 (mask=0x%02X): %s%s", g_tof_fault_mask,
-                 (g_tof_fault_mask & TOF_FAULT_TOF0) ? "TOF0(하단) " : "",
-                 (g_tof_fault_mask & TOF_FAULT_TOF1) ? "TOF1(상단) " : "");
+                 (g_tof_fault_mask & TOF_FAULT_TOF0) ? "TOF0(상단,I2C0) " : "",
+                 (g_tof_fault_mask & TOF_FAULT_TOF1) ? "TOF1(중하단,I2C1) " : "");
         ESP_LOGE(TAG, " 해당 방향의 장애물 감지가 동작하지 않습니다.");
         ESP_LOGE(TAG, " 배선(LPN/SDA/SCL)과 전원을 확인하세요.");
         ESP_LOGE(TAG, "════════════════════════════════════════════");
@@ -757,6 +985,21 @@ void TOF_FAULT_NOTIFY_TASK(void *pvParameters)
     }
 }
 
+#if SMARTCANE_TOF1_LONG_INTEGRATION
+static void apply_long_integration(VL53L5CX_Configuration *cfg, const char *name)
+{
+    uint8_t st;
+    if ((st = vl53l5cx_set_ranging_mode(cfg, VL53L5CX_RANGING_MODE_AUTONOMOUS)) != 0) {
+        ESP_LOGW(TAG, "%s set_ranging_mode(AUTONOMOUS) 실패 (status=0x%02X) - 기본 모드 유지", name, st);
+    } else if ((st = vl53l5cx_set_integration_time_ms(cfg, SMARTCANE_TOF1_INTEGRATION_MS)) != 0) {
+        ESP_LOGW(TAG, "%s set_integration_time(%dms) 실패 (status=0x%02X)", name,
+                 SMARTCANE_TOF1_INTEGRATION_MS, st);
+    } else {
+        ESP_LOGI(TAG, "%s autonomous, integration=%dms", name, SMARTCANE_TOF1_INTEGRATION_MS);
+    }
+}
+#endif
+
 void TOF_CONFIG_SETUP(void)
 {
     // 설정이 실패하면 해상도/주기가 기대와 달라져서 g_raw_grid 매핑 자체가 틀어진다.
@@ -767,41 +1010,99 @@ void TOF_CONFIG_SETUP(void)
     // 반드시 해상도를 먼저 설정한 뒤에 주파수를 설정해야 한다(반대 순서면 검증 실패).
     if ((st = vl53l5cx_set_resolution(&config_dev0, VL53L5CX_RESOLUTION_4X4)) != 0) {
         ESP_LOGE(TAG, "TOF0 set_resolution 실패 (status=0x%02X)", st);
-        g_tof_fault_mask |= TOF_FAULT_TOF0;
+        fault_mask_set(TOF_FAULT_TOF0);
     }
-    if ((st = vl53l5cx_set_ranging_frequency_hz(&config_dev0, 5)) != 0) {
+    if ((st = vl53l5cx_set_ranging_frequency_hz(&config_dev0, SMARTCANE_TOF_FREQ_HZ)) != 0) {
         ESP_LOGE(TAG, "TOF0 set_ranging_frequency 실패 (status=0x%02X)", st);
-        g_tof_fault_mask |= TOF_FAULT_TOF0;
+        fault_mask_set(TOF_FAULT_TOF0);
     }
 #endif
 
-    // TOF0 잠금 모드에서는 TOF1 혼자 전체 판정을 담당하므로 8x8로 올려서 해상도를
-    // 최대한 활용한다 (8x8은 15Hz 상한, 우리는 5Hz라 문제 없음). 두 센서를 같이 쓸 때는
-    // 동시 레인징 전류 문제로 4x4로 낮췄었는데, 지금은 TOF1 하나뿐이라 그 제약이 없다.
+    // TOF1(중·하단)은 8x8로 해상도를 최대한 활용한다 (8x8은 15Hz 상한, 우리는 5Hz라 문제 없음).
     if ((st = vl53l5cx_set_resolution(&config_dev1, VL53L5CX_RESOLUTION_8X8)) != 0) {
         ESP_LOGE(TAG, "TOF1 set_resolution 실패 (status=0x%02X)", st);
-        g_tof_fault_mask |= TOF_FAULT_TOF1;
+        fault_mask_set(TOF_FAULT_TOF1);
     }
-    if ((st = vl53l5cx_set_ranging_frequency_hz(&config_dev1, 5)) != 0) {
+    if ((st = vl53l5cx_set_ranging_frequency_hz(&config_dev1, SMARTCANE_TOF_FREQ_HZ)) != 0) {
         ESP_LOGE(TAG, "TOF1 set_ranging_frequency 실패 (status=0x%02X)", st);
-        g_tof_fault_mask |= TOF_FAULT_TOF1;
+        fault_mask_set(TOF_FAULT_TOF1);
     }
+
+#if SMARTCANE_TOF1_LONG_INTEGRATION
+    // 최대거리 늘리기: continuous 모드는 적분시간이 자동이라 멀리서 신호가 약해진다.
+    // autonomous 모드로 바꾸면 적분시간을 직접 줄 수 있다 (5Hz=200ms 주기 안쪽).
+    // 순서: 해상도 -> 주파수 -> 모드 -> 적분시간. 실패해도 고장으로 치지 않고 기본값으로 계속.
+    // 두 센서에 같은 설정을 적용한다.
+#if !SMARTCANE_TOF0_DISABLED
+    apply_long_integration(&config_dev0, "TOF0");
+#endif
+    apply_long_integration(&config_dev1, "TOF1");
+#endif
 }
 
-static void print_tof_grid(const VL53L5CX_ResultsData *results, const char *label)
+// 측정 모드 출력 설정
+#define TOF_PRINT_PERIOD_MS 1000 // 센서별 출력 주기
+#define TOF_PRINT_STATUS    0    // 1이면 거리 표 아래에 status/signal/nb_target 표도 같이 출력
+#define TOF_PRINT_TOP_ONLY  0   // 1이면 상단(TOF0, 4x4)만 출력, 0이면 중하단(TOF1, 8x8)도 같이 출력
+
+static void print_tof_grid(const VL53L5CX_ResultsData *results, const char *label, int n)
 {
-    printf("\n[%s] TOF 8x8 Grid (mm):\n", label);
-    printf("    ");
-    for (int col = 0; col < SMARTCANE_RAW_GRID_COLS; ++col) printf(" Col%d ", col);
+#if !SMARTCANE_MEASURE_MODE
+    // RPi 모드에서는 콘솔 텍스트가 USB 패킷을 오염시키거나(secondary 콘솔) TOF 루프를 느리게 하므로 출력 안 함.
+    (void)results; (void)label; (void)n;
+    return;
+#else
+    // 실측용: 센서별로 TOF_PRINT_PERIOD_MS(1초)에 한 번만 출력한다. (센서는 5Hz로 계속 측정하고 있음)
+    // [0]=TOF1(8x8), [1]=TOF0(4x4). 각 센서 태스크가 각자 호출하므로 센서별로 따로 시간을 잰다.
+#if TOF_PRINT_TOP_ONLY
+    if (n == 8) {
+        return; // 중하단(TOF1, 8x8)은 출력하지 않고 상단(TOF0, 4x4)만 찍는다
+    }
+#endif
+    static TickType_t s_last_print_tick[2] = { 0, 0 };
+    const int sensor_idx = (n == 8) ? 0 : 1;
+    const TickType_t now_tick = xTaskGetTickCount();
+    if (s_last_print_tick[sensor_idx] != 0 &&
+        (now_tick - s_last_print_tick[sensor_idx]) < pdMS_TO_TICKS(TOF_PRINT_PERIOD_MS)) {
+        return;
+    }
+    s_last_print_tick[sensor_idx] = now_tick;
+
+    // n = 한 변 칸 수 (8x8이면 8, 4x4면 4)
+    printf("\n[%s] Grid (mm):\n    ", label);
+    for (int col = 0; col < n; ++col) printf(" Col%d ", col);
     printf("\n");
-    for (int row = 0; row < SMARTCANE_RAW_GRID_COLS; ++row) {
+    for (int row = 0; row < n; ++row) {
         printf("Row%d:", row);
-        for (int col = 0; col < SMARTCANE_RAW_GRID_COLS; ++col) {
-            int idx = row * SMARTCANE_RAW_GRID_COLS + col;
-            printf("%6d", results->distance_mm[idx]);
+        for (int col = 0; col < n; ++col) {
+            printf("%6d", results->distance_mm[(row * n + col) * VL53L5CX_NB_TARGET_PER_ZONE]);
         }
         printf("\n");
     }
+
+#if TOF_PRINT_STATUS
+    // 디버그용: 칸별 target_status(5/9=유효), signal_per_spad, nb_target.
+    // 멀리 있는 물체가 안 보일 때 "상태가 뭔지, 신호가 얼마나 약한지"를 보려는 것.
+    printf("  status(5/9=OK) | signal_per_spad(>=40 필요) | nb_target\n");
+    for (int row = 0; row < n; ++row) {
+        printf("R%d:", row);
+        for (int col = 0; col < n; ++col) {
+            const int i = row * n + col;
+            printf("%4u", (unsigned)results->target_status[i * VL53L5CX_NB_TARGET_PER_ZONE]);
+        }
+        printf(" |");
+        for (int col = 0; col < n; ++col) {
+            const int i = row * n + col;
+            printf("%7u", (unsigned)results->signal_per_spad[i * VL53L5CX_NB_TARGET_PER_ZONE]);
+        }
+        printf(" |");
+        for (int col = 0; col < n; ++col) {
+            printf("%2u", (unsigned)results->nb_target_detected[row * n + col]);
+        }
+        printf("\n");
+    }
+#endif // TOF_PRINT_STATUS
+#endif // SMARTCANE_MEASURE_MODE
 }
 
 // Haptic consumer (shared implementation). pvParameters = (void*)(uintptr_t)channel
@@ -884,7 +1185,7 @@ void TOF0_TASK(void *pvParameters)
 
     if (vl53l5cx_start_ranging(&config_dev0) != 0) {
         ESP_LOGE(TAG, "TOF0 start_ranging 실패");
-        g_tof_fault_mask |= TOF_FAULT_TOF0;
+        fault_mask_set(TOF_FAULT_TOF0);
     }
     TickType_t last_success_tick = xTaskGetTickCount();
     int consecutive_restarts = 0;
@@ -898,14 +1199,14 @@ void TOF0_TASK(void *pvParameters)
                 if (consecutive_restarts > 0 || (g_tof_fault_mask & TOF_FAULT_TOF0)) {
                     ESP_LOGW(TAG, "TOF0 정상 복귀");
                     consecutive_restarts = 0;
-                    g_tof_fault_mask &= (uint8_t)~TOF_FAULT_TOF0;
+                    fault_mask_clear(TOF_FAULT_TOF0);
                 }
-                print_tof_grid(&results, "TOF0");
+                print_tof_grid(&results, "TOF0 상단(I2C0) 4x4", TOP_GRID_COLS);
 
                 if (g_tof_state_mutex != nullptr) {
                     xSemaphoreTake(g_tof_state_mutex, portMAX_DELAY);
                 }
-                ingest_sensor_rows_locked(&results, SMARTCANE_RAW_GRID_ROWS / 2); // TOF0 = 하단 물리배치 -> row 4-7
+                ingest_top_4x4_locked(&results); // TOF0 = 상단 담당(4x4)
                 recompute_zone_grid_locked();
                 // 판정은 "살아있는 센서가 모두 새 데이터를 준" 회차마다 1번만
                 // (take_eval_round_locked() 주석 참고)
@@ -939,11 +1240,11 @@ void TOF0_TASK(void *pvParameters)
                 if (!(g_tof_fault_mask & TOF_FAULT_TOF0)) {
                     ESP_LOGE(TAG, "TOF0 재시작 %d회 실패 - 고장으로 판정", consecutive_restarts);
                 }
-                g_tof_fault_mask |= TOF_FAULT_TOF0;
+                fault_mask_set(TOF_FAULT_TOF0);
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(TOF_POLL_MS));
     }
 }
 
@@ -959,7 +1260,7 @@ void TOF1_TASK(void *pvParameters)
 
     if (vl53l5cx_start_ranging(&config_dev1) != 0) {
         ESP_LOGE(TAG, "TOF1 start_ranging 실패");
-        g_tof_fault_mask |= TOF_FAULT_TOF1;
+        fault_mask_set(TOF_FAULT_TOF1);
     }
     TickType_t last_success_tick = xTaskGetTickCount();
     int consecutive_restarts = 0;
@@ -972,14 +1273,14 @@ void TOF1_TASK(void *pvParameters)
                 if (consecutive_restarts > 0 || (g_tof_fault_mask & TOF_FAULT_TOF1)) {
                     ESP_LOGW(TAG, "TOF1 정상 복귀");
                     consecutive_restarts = 0;
-                    g_tof_fault_mask &= (uint8_t)~TOF_FAULT_TOF1;
+                    fault_mask_clear(TOF_FAULT_TOF1);
                 }
-                print_tof_grid(&results, "TOF1");
+                print_tof_grid(&results, "TOF1 중하단(I2C1) 8x8", SMARTCANE_RAW_GRID_COLS);
 
                 if (g_tof_state_mutex != nullptr) {
                     xSemaphoreTake(g_tof_state_mutex, portMAX_DELAY);
                 }
-                ingest_sensor_rows_locked(&results, 0); // TOF1 = 상단 물리배치 -> row 0-3
+                ingest_midlow_8x8_locked(&results); // TOF1 = 중·하단 담당(8x8)
                 recompute_zone_grid_locked();
                 if (take_eval_round_locked()) {
                     evaluate_zone_grid_and_act_locked("TOF1");
@@ -1004,10 +1305,10 @@ void TOF1_TASK(void *pvParameters)
                 if (!(g_tof_fault_mask & TOF_FAULT_TOF1)) {
                     ESP_LOGE(TAG, "TOF1 재시작 %d회 실패 - 고장으로 판정", consecutive_restarts);
                 }
-                g_tof_fault_mask |= TOF_FAULT_TOF1;
+                fault_mask_set(TOF_FAULT_TOF1);
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(TOF_POLL_MS));
     }
-}
+}
